@@ -13,12 +13,12 @@ This library is a fork of the original PIDEasy library.
 ### Arduino IDE (Manual Installation)
 1. Download the latest version of **PIDEasy-Improved** from the [GitHub Releases](https://github.com/kwlew/PIDEasy-Improved/releases).
 2. Extract the ZIP file.
-3. Move the `PIDEasy` folder to your Arduino libraries directory:
+3. Move the `PIDEasy-Improved` folder to your Arduino libraries directory:
    - **Windows:** `Documents/Arduino/libraries`
    - **Mac:** `~/Documents/Arduino/libraries`
    - **Linux:** `~/Arduino/libraries`
 4. Restart the Arduino IDE.
-5. Go to **Sketch** > **Include Library** > **Manage Libraries**, search for `PIDEasy`, and check if it's installed.
+5. Go to **Sketch** > **Include Library** > **Manage Libraries**, search for `PIDEasy-Improved`, and check if it's installed.
 
 ## 📖 Usage
 
