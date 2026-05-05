@@ -1,5 +1,6 @@
 PID                  KEYWORD1
 compute              FUNCTION
+reset                FUNCTION
 setWindUP            FUNCTION
 setConstrain         FUNCTION
 setSmoothingDerivate FUNCTION

@@ -6,6 +6,7 @@ class PID {
     PID(float kp, float ki, float kd);
 
     float compute(float error, unsigned long dt);
+    void reset();
     void setWindUP(float min, float max);
     void setConstrain(int min, int max);
     void setSmoothingDerivate(float sD);
