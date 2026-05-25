@@ -9,9 +9,14 @@ class PID {
     PID(float kp = 0.0, float ki = 0.0, float kd = 0.0);
 
     // Compute control output.
-    // - Variant A: supply the time delta `dt` in milliseconds.
-    // - Variant B: call without `dt` and the object will use `millis()` to compute dt.
+    // Backwards-compatible Variant A: `compute(error, dt)` expects `dt` in seconds
+    // (original library used seconds). Use this to avoid breaking existing sketches.
     float compute(float error, unsigned long dt);
+
+    // New Variant: pass `dt` in milliseconds.
+    float computeMs(float error, unsigned long dt_ms);
+
+    // Convenience: compute using `millis()` internally (uses milliseconds).
     float compute(float error);
 
     void reset();
