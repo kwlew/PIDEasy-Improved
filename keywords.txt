@@ -4,4 +4,5 @@ reset                FUNCTION
 setWindUP            FUNCTION
 setConstrain         FUNCTION
 setSmoothingDerivate FUNCTION
+setSmoothingDerivative FUNCTION
 setDampingFactor     FUNCTION

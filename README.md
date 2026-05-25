@@ -33,11 +33,19 @@ PID myPID(1.0, 0.5, 0.1); // Kp, Ki, Kd
 ```
 
 ### 3️⃣ Compute the PID Output
+The library expects `dt` in milliseconds. There are two ways to use `compute()`:
+
+- Supply `dt` yourself (in milliseconds):
 ```cpp
 float error = desiredValue - actualValue;
-unsigned long dt = millis() - lastTime;
+unsigned long dt = millis() - lastTime; // dt in ms
 float control = myPID.compute(error, dt);
 lastTime = millis();
+```
+
+- Or use the convenience overload that uses `millis()` internally:
+```cpp
+float control = myPID.compute(error); // uses internal millis() to compute dt
 ```
 
 ### 4️⃣ Set Constraints (Optional)
@@ -52,7 +60,9 @@ myPID.setWindUP(-255, 255);
 
 ### 6️⃣ Adjust Derivative Smoothing (Optional)
 ```cpp
-myPID.setSmoothingDerivative(0.8);
+myPID.setSmoothingDerivative(0.8); // preferred name
+// or the backwards-compatible alias:
+myPID.setSmoothingDerivate(0.8);
 ```
 
 ### 7️⃣ Adjust Damping Factor (Optional)
