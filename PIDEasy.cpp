@@ -10,7 +10,7 @@ PID::PID(float kp, float ki, float kd) {
   integral = 0.0f;
   setWindUP(-255.0f, 255.0f);
   setConstrain(-255.0f, 255.0f);
-  derivative_smoothing = 1.0f; // no smoothing by default
+  derivative_smoothing = 0.0f; // no smoothing by default (0=no smoothing, 1=full smoothing)
   dampingFactor = 1.0f;
   lastMillis = 0;
   hasLastMillis = false;
@@ -24,8 +24,9 @@ static float constrainFloat(float x, float a, float b) {
 }
 
 // Compute the PID output. dt is in milliseconds.
-float PID::compute(float error, unsigned long dt_ms) {
-  // Convert dt to seconds for consistent units
+// Compute with dt specified in milliseconds.
+float PID::computeMs(float error, unsigned long dt_ms) {
+  // Convert dt to seconds for internal calculations
   float dt = (dt_ms == 0) ? 0.001f : (dt_ms / 1000.0f);
 
   integral += error * dt;
@@ -46,6 +47,15 @@ float PID::compute(float error, unsigned long dt_ms) {
   return constrainFloat(output, min_constrain, max_constrain);
 }
 
+// Backwards-compatible compute: dt provided in seconds (original behavior).
+float PID::compute(float error, unsigned long dt_seconds) {
+  // Guard: if dt_seconds is zero, use 1 second as original library did.
+  unsigned long dt_sec_nonzero = (dt_seconds == 0) ? 1 : dt_seconds;
+  // Convert seconds to milliseconds and call computeMs
+  unsigned long dt_ms = dt_sec_nonzero * 1000UL;
+  return computeMs(error, dt_ms);
+}
+
 // Compute using millis() to determine dt. First call initializes internal timer.
 float PID::compute(float error) {
   unsigned long now = millis();
@@ -59,7 +69,7 @@ float PID::compute(float error) {
     lastMillis = now;
     if (dt_ms == 0) dt_ms = 1;
   }
-  return compute(error, dt_ms);
+  return computeMs(error, dt_ms);
 }
 
 // Set the minimum and maximum output of the PID controller.

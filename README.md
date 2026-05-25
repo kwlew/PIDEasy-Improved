@@ -33,24 +33,32 @@ PID myPID(1.0, 0.5, 0.1); // Kp, Ki, Kd
 ```
 
 ### 3️⃣ Compute the PID Output
-The library expects `dt` in milliseconds. There are two ways to use `compute()`:
+The library preserves the original API for backwards compatibility.
 
-- Supply `dt` yourself (in milliseconds):
+
+- Backwards-compatible `compute(error, dt)` expects `dt` in seconds (original behavior). If you measure time with `millis()`, convert to seconds before calling:
 ```cpp
 float error = desiredValue - actualValue;
-unsigned long dt = millis() - lastTime; // dt in ms
-float control = myPID.compute(error, dt);
+unsigned long dt_ms = millis() - lastTime;
+unsigned long dt_seconds = dt_ms / 1000UL; // integer seconds (original API uses unsigned long seconds)
+float control = myPID.compute(error, dt_seconds);
 lastTime = millis();
 ```
 
-- Or use the convenience overload that uses `millis()` internally:
+- New: if you have `dt` in milliseconds, use `computeMs(error, dt_ms)`:
 ```cpp
-float control = myPID.compute(error); // uses internal millis() to compute dt
+unsigned long dt_ms = millis() - lastTime; // dt in ms
+float control = myPID.computeMs(error, dt_ms);
+```
+
+- Convenience overload `compute(error)` uses `millis()` internally and calls the millisecond variant:
+```cpp
+float control = myPID.compute(error); // uses internal millis() to compute dt (ms)
 ```
 
 ### 4️⃣ Set Constraints (Optional)
 ```cpp
-myPID.setConstrain(-255, 255); // Limit output
+myPID.setConstrain(-255.0, 255.0); // Limit output (float allowed)
 ```
 
 ### 5️⃣ Enable Windup Prevention (Optional)
