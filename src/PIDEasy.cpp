@@ -1,7 +1,7 @@
 #include "PIDEasy.h"
 
 // Constructor to initialize the PID controller.
-PID::PID(float kp, float ki, float kd) {
+PID::PID(const float kp, const float ki, const float kd) {
   this->kp = kp;
   this->ki = ki;
   this->kd = kd;
@@ -27,7 +27,7 @@ static float constrainFloat(float x, float a, float b) {
 // Compute with dt specified in milliseconds.
 float PID::computeMs(float error, unsigned long dt_ms) {
   // Convert dt to seconds for internal calculations
-  float dt = (dt_ms == 0) ? 0.001f : (dt_ms / 1000.0f);
+  const float dt = (dt_ms == 0) ? 0.001f : (dt_ms / 1000.0f);
 
   integral += error * dt;
   integral = constrainFloat(integral, min_windup, max_windup);
@@ -39,7 +39,7 @@ float PID::computeMs(float error, unsigned long dt_ms) {
   float derivative = (error - previous_error) / dt;
   derivative = (derivative_smoothing * previous_derivative) + ((1.0f - derivative_smoothing) * derivative);
 
-  float output = (kp * error) + (ki * integral) + (kd * derivative);
+  const float output = (kp * error) + (ki * integral) + (kd * derivative);
 
   previous_error = error;
   previous_derivative = derivative;
@@ -48,17 +48,17 @@ float PID::computeMs(float error, unsigned long dt_ms) {
 }
 
 // Backwards-compatible compute: dt provided in seconds (original behavior).
-float PID::compute(float error, unsigned long dt_seconds) {
+float PID::compute(const float error, const unsigned long dt) {
   // Guard: if dt_seconds is zero, use 1 second as original library did.
-  unsigned long dt_sec_nonzero = (dt_seconds == 0) ? 1 : dt_seconds;
+  const unsigned long dt_sec_nonzero = (dt == 0) ? 1 : dt;
   // Convert seconds to milliseconds and call computeMs
-  unsigned long dt_ms = dt_sec_nonzero * 1000UL;
+  const unsigned long dt_ms = dt_sec_nonzero * 1000UL;
   return computeMs(error, dt_ms);
 }
 
 // Compute using millis() to determine dt. First call initializes internal timer.
-float PID::compute(float error) {
-  unsigned long now = millis();
+float PID::compute(const float error) {
+  const unsigned long now = millis();
   unsigned long dt_ms = 0;
   if (!hasLastMillis) {
     hasLastMillis = true;
@@ -93,11 +93,6 @@ void PID::setSmoothingDerivative(float sD) {
   if (sD < 0.0f) sD = 0.0f;
   if (sD > 1.0f) sD = 1.0f;
   this->derivative_smoothing = sD;
-}
-
-// Backwards-compatible alias for the original misspelled API.
-void PID::setSmoothingDerivate(float sD) {
-  setSmoothingDerivative(sD);
 }
 
 // Set the windup limits for the integral term to prevent integral windup.
