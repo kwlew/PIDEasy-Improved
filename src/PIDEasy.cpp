@@ -23,6 +23,13 @@ static float constrainFloat(float x, float a, float b) {
   return x;
 }
 
+// Internal helper: constrain double between min and max
+static double constrainDouble(double x, double a, double b) {
+  if (x < a) return a;
+  if (x > b) return b;
+  return x;
+}
+
 // Compute the PID output. dt is in milliseconds.
 // Compute with dt specified in milliseconds.
 float PID::computeMs(float error, unsigned long dt_ms) {
