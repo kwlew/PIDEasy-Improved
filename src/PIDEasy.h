@@ -17,6 +17,8 @@ class PID {
 
     float compute(float error);
 
+    float compute(double error);
+
     void reset();
 
     void setWindUP(float min, float max);

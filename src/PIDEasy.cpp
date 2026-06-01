@@ -72,6 +72,46 @@ float PID::compute(const float error) {
   return computeMs(error, dt_ms);
 }
 
+// Double overload: use double-precision intermediates for ESP32.
+float PID::compute(const double error) {
+  const unsigned long now = millis();
+  unsigned long dt_ms = 0;
+  if (!hasLastMillis) {
+    hasLastMillis = true;
+    lastMillis = now;
+    dt_ms = 1;
+  } else {
+    dt_ms = now - lastMillis;
+    lastMillis = now;
+    if (dt_ms == 0) dt_ms = 1;
+  }
+
+  const double dt = (dt_ms == 0) ? 0.001 : (dt_ms / 1000.0);
+  const double previousError = static_cast<double>(previous_error);
+  double integralValue = static_cast<double>(integral) + (error * dt);
+  integralValue = constrainDouble(integralValue, static_cast<double>(min_windup), static_cast<double>(max_windup));
+
+  if ((error > 0.0 && previousError < 0.0) || (error < 0.0 && previousError > 0.0)) {
+    integralValue *= static_cast<double>(dampingFactor);
+  }
+
+  const double derivative = (error - previousError) / dt;
+  const double smoothedDerivative =
+    (static_cast<double>(derivative_smoothing) * static_cast<double>(previous_derivative)) +
+    ((1.0 - static_cast<double>(derivative_smoothing)) * derivative);
+
+  const double output =
+    (static_cast<double>(kp) * error) +
+    (static_cast<double>(ki) * integralValue) +
+    (static_cast<double>(kd) * smoothedDerivative);
+
+  previous_error = static_cast<float>(error);
+  previous_derivative = static_cast<float>(smoothedDerivative);
+  integral = static_cast<float>(integralValue);
+
+  return constrainFloat(static_cast<float>(output), min_constrain, max_constrain);
+}
+
 // Set the minimum and maximum output of the PID controller.
 void PID::setConstrain(float min, float max) {
   this->min_constrain = min;
