@@ -17,8 +17,6 @@ class PID {
 
     float compute(float error);
 
-    float compute(double error);
-
     void reset();
 
     void setWindUP(float min, float max);
@@ -26,6 +24,9 @@ class PID {
     void setConstrain(float min, float max);
 
     void setSmoothingDerivative(float sD);
+
+    // Backwards-compatible alias for setSmoothingDerivative().
+    void setSmoothingDerivate(float sD);
 
     void setDampingFactor(float dF);
 
@@ -37,6 +38,10 @@ class PID {
     float min_windup, max_windup;
     float derivative_smoothing, dampingFactor;
     float min_constrain, max_constrain;
+
+    // True once a valid previous_error exists; used to suppress the
+    // derivative term on the first sample (avoids a derivative "kick").
+    bool hasPreviousError;
 
     // For compute() overload that uses millis()
     unsigned long lastMillis;
