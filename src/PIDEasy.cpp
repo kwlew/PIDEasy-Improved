@@ -15,6 +15,7 @@ PID::PID(const float kp, const float ki, const float kd) {
   hasPreviousError = false;
   lastMillis = 0;
   hasLastMillis = false;
+  max_dt_ms = 1000; // cap internally measured dt at 1 s by default
 }
 
 // Internal helper: constrain float between min and max
@@ -72,12 +73,17 @@ float PID::compute(const float error) {
     dt_ms = now - lastMillis;
     lastMillis = now;
     if (dt_ms == 0) dt_ms = 1;
+    // Cap dt so a long pause (e.g. robot stopped to signal a victim)
+    // doesn't produce one giant integral step on resume.
+    if (max_dt_ms > 0 && dt_ms > max_dt_ms) dt_ms = max_dt_ms;
   }
   return computeMs(error, dt_ms);
 }
 
 // Set the minimum and maximum output of the PID controller.
+// Arguments are swapped automatically if given in the wrong order.
 void PID::setConstrain(float min, float max) {
+  if (min > max) { const float tmp = min; min = max; max = tmp; }
   this->min_constrain = min;
   this->max_constrain = max;
 }
@@ -106,12 +112,23 @@ void PID::setSmoothingDerivate(float sD) {
 }
 
 // Set the windup limits for the integral term to prevent integral windup.
+// Arguments are swapped automatically if given in the wrong order.
 void PID::setWindUP(float min, float max) {
+  if (min > max) { const float tmp = min; min = max; max = tmp; }
   this->min_windup = min;
   this->max_windup = max;
 }
 
 // Set the damping factor for the integral term when the error changes sign.
+// Clamped to [0..1]: values above 1 would amplify the integral at every
+// zero crossing and values below 0 would flip its sign.
 void PID::setDampingFactor(float dF) {
+  if (dF < 0.0f) dF = 0.0f;
+  if (dF > 1.0f) dF = 1.0f;
   this->dampingFactor = dF;
+}
+
+// Cap the dt measured internally by compute(error). 0 disables the cap.
+void PID::setMaxDeltaTime(unsigned long maxDtMs) {
+  this->max_dt_ms = maxDtMs;
 }

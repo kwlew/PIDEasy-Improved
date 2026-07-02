@@ -30,6 +30,11 @@ class PID {
 
     void setDampingFactor(float dF);
 
+    // Cap the dt measured internally by compute(error) (milliseconds).
+    // Protects against a huge integral step after a pause (e.g. victim
+    // signaling). Default 1000 ms. Pass 0 to disable the cap.
+    void setMaxDeltaTime(unsigned long maxDtMs);
+
   private:
     float kp, ki, kd;
     float previous_error;
@@ -46,6 +51,7 @@ class PID {
     // For compute() overload that uses millis()
     unsigned long lastMillis;
     bool hasLastMillis;
+    unsigned long max_dt_ms;
 };
 
 #endif
