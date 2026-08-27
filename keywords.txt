@@ -8,3 +8,14 @@ setSmoothingDerivate	KEYWORD2
 setSmoothingDerivative	KEYWORD2
 setDampingFactor	KEYWORD2
 setMaxDeltaTime	KEYWORD2
+setTunings	KEYWORD2
+getKp	KEYWORD2
+getKi	KEYWORD2
+getKd	KEYWORD2
+setIntegralLimit	KEYWORD2
+setConditionalIntegration	KEYWORD2
+getP	KEYWORD2
+getI	KEYWORD2
+getD	KEYWORD2
+getOutput	KEYWORD2
+setDerivativeTimeConstant	KEYWORD2
