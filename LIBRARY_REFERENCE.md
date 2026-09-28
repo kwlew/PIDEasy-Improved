@@ -1,157 +1,265 @@
 # PIDEasy-Improved — Library Reference
 
-Reference for auditing robot code that uses this library (RoboCup Junior Rescue Maze).
-Covers version 1.1.0. One class: `PID`, declared in `src/PIDEasy.h`, implemented in `src/PIDEasy.cpp`.
+Reference for writing and auditing robot code that uses this library (RoboCup Junior, WRO, line followers, sumo, anything with motors and sensors).
+Covers version 1.2.0. One class: `PIDEasy` (with `PID` as an alias), declared in `src/PIDEasy.h`, implemented in `src/PIDEasy.cpp`.
 
-## ⚠️ Behavior changes in 1.1.0
+## ⚠️ Behavior changes in 1.2.0
 
-All existing method signatures are unchanged and old sketches still compile, but two defaults now behave differently:
+Every 1.1.x sketch still compiles. These changes can alter how a tuned robot behaves:
 
-1. **Conditional integration is ON by default.** When the output is already outside the constrain limits and the current step would push it further out, the integration step is rolled back. Previously the integral kept charging while the motors were saturated and then dumped as overshoot. To restore the old behavior: `setConditionalIntegration(false)`.
-2. **`setMaxDeltaTime()` now defaults to 100 ms (was 1000 ms), and an over-cap gap is treated as a *resume*** — the integral and derivative are skipped for that one sample instead of taking a full clamped step. To restore something close to the old behavior: `setMaxDeltaTime(1000)`.
+1. **`compute(error)` times itself with `micros()` instead of `millis()`.** dt is now accurate at 1–2 kHz, where the old whole-millisecond timing made the derivative jitter by up to ±50%. The D-term will look calmer. Any gain you tuned to compensate for that jitter may need re-checking.
+2. **The I-term is stored in output units.** Changing `ki` with `setTunings()` no longer makes the output jump (1.1.x scaled the whole accumulated integral by the new `ki`). `setTunings()` with `ki = 0` now clears the I-term.
+3. **No raw windup clamp by default.** 1.1.x clamped the raw integral to ±255, so a small `ki` could never contribute more than `ki × 255` (12.75 with `ki = 0.05`). Now the I-term is bounded by ± the *width* of the output range (±510 for the default −255…255), and conditional integration keeps it in check while saturated. `setWindUP()` still works exactly as before when you call it.
+4. **`setMaxDeltaTime()` defaults to 500 ms (was 100 ms).** At 100 ms, robots with slow sensor loops (e.g. several ToF reads per cycle) had every sample treated as a pause, so I and D never acted. Use `wasResumed()` to check.
+5. **The two-argument `compute(error, dt)` is deprecated.** It still works exactly as before, but compiling with warnings on now points you to `computeMs()` / `computeSeconds()`.
 
-Both changes only affect the one-argument `compute(error)` (change 2) and any call where the output saturates (change 1). If you had tuned around the old windup behavior, re-check your gains.
+And from 1.1.1:
+
+- A **NaN or infinite error** returns the previous output and changes nothing. It used to poison the integral until `reset()`.
+- The **first** `compute(error)` call no longer integrates a phantom 1 ms. A call with no elapsed time returns the previous output unchanged. Before, it counted as 1 ms, which made the I-term grow several times too fast above 1 kHz.
+
+### From 1.0.x (changed in 1.1.0)
+
+- **Conditional integration is ON by default.** `setConditionalIntegration(false)` restores the old behavior.
+- **Gaps longer than `setMaxDeltaTime()` are a *resume*.** For that one sample the integral and derivative are skipped, instead of taking a clamped step.
 
 ## Quick model of how it works
 
-Each `compute*` call does, in order:
+Each `compute*` / `update*` call does, in order:
 
-1. `integral += error * dt` (dt internally in **seconds**), then clamps `integral` to the windup limits and, if enabled, to the output-unit integral limit. **Skipped entirely on a resume sample.**
-2. If `error` changed sign versus the previous call (strictly positive → strictly negative or vice versa), multiplies `integral` by `dampingFactor`.
-3. Derivative = `(error - previous_error) / dt`, **forced to 0 on the very first sample** after construction or `reset()`, and on a resume sample (avoids derivative kick). Then low-pass filtered: `d = smoothing * previous_d + (1 - smoothing) * d`, where `smoothing` is either the fixed coefficient from `setSmoothingDerivative()` or `tau / (tau + dt)` when `setDerivativeTimeConstant()` is in use.
-4. Output = `kp*error + ki*integral + kd*derivative`.
-5. **Conditional integration:** if that output is past a constrain limit *and* step 1 pushed it further out, the integral is rolled back to its pre-step value (damping from step 2 still applied) and the output is recomputed.
-6. Output clamped to the constrain limits and returned.
-7. Stores `previous_error`, `previous_derivative`, and the per-term contributions for the getters.
+0. **Hold checks.** If an input is NaN or infinite, or no time has passed (dt = 0 in the new variants, or the internal timer has not ticked), the call returns the previous output and changes nothing.
+1. **Error.** `error` is either passed in (`compute*`) or `setpoint − measurement` (`update*`). With `setContinuousInput()` it is wrapped into ± half the range.
+2. **Integral.** `I += ki × error × dt`, then I is clamped to ± the output range width, to `ki × setWindUP()` limits if set, and to `setIntegralLimit()` if set. **Skipped on a resume sample.**
+3. **Damping.** If `error` changed sign versus the previous call (strictly), `I *= dampingFactor`.
+4. **Derivative.** `compute*` differentiates the **error**; `update*` differentiates **−measurement**, so setpoint changes cause no kick. The difference is wrapped too with continuous input. The derivative is forced to 0 on the first sample, on a resume, and on the first sample after switching between `compute*` and `update*`. It is then low-pass filtered: `d = d + smoothing × (previous_d − d)`, with `smoothing` from `setSmoothingDerivative()` or `tau / (tau + dt)`.
+5. **Sum.** `output = kp×error + I + kd×derivative + feedforward`. Feedforward is `kF×setpoint + kS×sign(setpoint)`, for `update*` only.
+6. **Conditional integration.** If that output is past a constrain limit *and* step 2 pushed it further out, I is rolled back (step 3's damping still applies) and the output is recomputed.
+7. **Settle tracking** for `atSetpoint()`.
+8. **Shaping.** `setMinOutput()` lifts small nonzero outputs (not inside the tolerance band). `setOutputRampRate()` limits the change from the previous output.
+9. **Clamp** to the constrain limits and return.
 
-All internal math is `float`.
+All internal math is `float`. All inputs and outputs are in *your* units; dt is handled internally in seconds.
 
 ---
 
 ## Constructor
 
 ```cpp
-PID(float kp = 0.0, float ki = 0.0, float kd = 0.0);
+PIDEasy(float kp = 0.0, float ki = 0.0, float kd = 0.0);
+PID     myPid(1.0, 0.5, 0.1);   // same class; PID is an alias
 ```
-
-Defaults set by the constructor:
 
 | State | Default |
 |---|---|
-| Windup limits (integral clamp) | −255 … +255 |
 | Output constrain | −255 … +255 |
-| Integral limit (output units) | disabled |
-| Conditional integration | **enabled** |
-| Derivative smoothing | 0 (no smoothing, fixed-coefficient mode) |
+| I-term bound | ± output range width (always on) |
+| Raw windup clamp (`setWindUP`) | off |
+| Integral limit, output units | off |
+| Conditional integration | **on** |
+| Derivative smoothing | off (fixed-coefficient mode, 0) |
 | Damping factor | 1.0 (no damping) |
-| Max internal dt | **100 ms** |
+| Max internal dt | **500 ms** |
+| Continuous input | off |
+| Tolerance / `atSetpoint()` | not set (`atSetpoint()` is false) |
+| Feedforward, min output, ramp rate | off |
 
-## Compute functions (three variants — dt units differ!)
+### Name clashes (`PIDEASY_NO_PID_ALIAS`)
+`PID_v1` and some other libraries also define a class named `PID`. To use one of them in the same sketch:
 
-### `float compute(float error, unsigned long dt)` — dt in **SECONDS**
-Backwards-compatible with the original PIDEasy. `dt` is an **integer number of seconds**; `dt == 0` is treated as **1 second**.
+```cpp
+#define PIDEASY_NO_PID_ALIAS
+#include <PIDEasy.h>
+#include <PID_v1.h>
 
-⚠️ **Trap:** in a typical robot loop that runs every 10–100 ms, any dt you can pass here truncates to 0 and becomes **1 full second**. That makes the integral accumulate ~10–100× too fast and the derivative ~10–100× too weak. **Do not use this variant on the robot.** If robot code calls the two-argument `compute()` with a millis-based dt, that is a bug — it should be `computeMs()`.
+PIDEasy heading(2.0, 0.0, 0.3);
+```
 
-### `float computeMs(float error, unsigned long dt_ms)` — dt in **milliseconds**
-The correct variant when you measure dt yourself. `dt_ms == 0` is treated as 1 ms. Never produces a resume sample — you own the timing here.
+## Compute functions — pick one per controller
 
-### `float compute(float error)` — dt measured internally with `millis()`
-First call initializes the internal timer and uses dt = 1 ms (derivative is suppressed anyway on the first sample). Subsequent calls use elapsed `millis()`. Handles `millis()` rollover correctly (unsigned subtraction).
+| Call | dt | Derivative of | Use when |
+|---|---|---|---|
+| `compute(error)` | measured with `micros()` | error | you already have an error value |
+| `computeMs(error, dt_ms)` | milliseconds, you measure | error | fixed-rate loops timed with `millis()` |
+| `computeUs(error, dt_us)` | microseconds, you measure | error | very fast loops |
+| `computeSeconds(error, dt_s)` | float seconds, you measure | error | you already have dt in seconds |
+| `update(setpoint, measurement)` | measured with `micros()` | measurement | **turns, wall distance, speed — anything with a setpoint** |
+| `updateMs` / `updateUs` / `updateSeconds` | as above | measurement | same, with your own dt |
+| `compute(error, dt)` *(deprecated)* | **whole seconds** | error | never on a robot |
 
-If the measured gap exceeds `setMaxDeltaTime()` (default 100 ms), the sample is treated as a **resume**: the integral is left untouched and the derivative is forced to 0 for that call. Normal behavior returns on the next in-window sample. Calling `reset()` after a pause is still the cleaner option when you also want the accumulated integral cleared.
+All return the output (also available as `getOutput()`).
 
-⚠️ **Trap:** if the loop runs **faster than 1 kHz**, dt clamps to 1 ms while real dt is shorter → derivative is over-estimated and jittery. Add a small delay or use `computeMs` with `micros()`-derived timing if your loop is that fast.
+### `float compute(float error)` / `float update(float setpoint, float measurement)` — internal timer
+The two share one `micros()` timer, kept as 32-bit values so the ~71-minute rollover is handled on every core. The first call after construction or `reset()` only starts the timer: it counts as a resume, so it neither integrates nor differentiates. A call before the clock has ticked returns the previous output unchanged. `micros()` has a 4 µs resolution on 16 MHz AVR.
 
-## `void reset()`
-Clears integral, previous error, previous derivative, the first-sample flag, the internal `millis()` timer, and the telemetry getters. **Call this whenever the setpoint changes discontinuously** (start of a turn, new wall-follow segment, after a pause). Because the derivative acts on *error*, a sudden setpoint change otherwise produces a one-cycle derivative kick.
+If the gap since the previous call exceeds `setMaxDeltaTime()` (default 500 ms), the sample is a **resume**. The integral is left untouched and the derivative is 0 for that call. Normal behavior returns on the next sample. `reset()` after a planned pause is still cleaner if you also want the integral cleared.
 
-## `void setTunings(float kp, float ki, float kd)` *(new in 1.1.0)*
-Replaces all three gains at runtime. **Internal state is deliberately preserved** — integral, derivative history, and the `millis()` timer all survive, so a mode switch (line follow → gap → turn) is bumpless. Call `reset()` alongside it if you *want* the state cleared.
+### `float computeMs(float error, unsigned long dt_ms)`
+`dt_ms == 0` is treated as 1 ms (unchanged from 1.x). Never a resume: you own the timing.
 
-Re-applies the output-unit integral limit, since that limit is defined relative to `ki`.
+### `float computeUs(float error, unsigned long dt_us)` / `float computeSeconds(float error, float dt_s)` *(new in 1.2.0)*
+`dt == 0` (or negative or NaN for seconds) returns the previous output unchanged.
 
-## `float getKp()` / `float getKi()` / `float getKd()` *(new in 1.1.0)*
+### `updateMs` / `updateUs` / `updateSeconds(setpoint, measurement, dt)` *(new in 1.2.0)*
+Same timing as the matching `compute*`, except `updateMs(…, 0)` holds instead of assuming 1 ms.
+
+### Why `update()` over `compute(error)`
+With `compute(error)`, a new target changes the error in one step. The D-term then spikes: going from heading 0 to target 90 with `kd = 0.5` on a 10 ms loop gives a D-term of **4500** for one cycle. `update()` differentiates only the measurement, so the same step gives 0. With a fixed setpoint the two give identical results.
+
+Switching one object between `compute*` and `update*` is allowed. The derivative is 0 for the first sample after a switch.
+
+### `float compute(float error, unsigned long dt)` — deprecated, dt in **whole SECONDS**
+Kept for sketches written for the original PIDEasy. `dt == 0` counts as **1 second**, and any real loop period truncates to 0. The integral then grows 10–100× too fast and the derivative is 10–100× too weak. If robot code calls this with a millis-based dt, that is a bug: use `computeMs()`.
+
+## State
+
+### `void reset()`
+Clears the I-term, derivative history, internal timer, telemetry, and settle state. Gains and settings are kept. Call it before a new motion (a turn, a new corridor) and after a pause.
+
+### `void resetIntegral()` *(new in 1.2.0)*
+Clears only the I-term; the derivative history and timer are kept.
+
+### `void setIntegral(float value)` *(new in 1.2.0)*
+Preloads the I-term in output units, e.g. the PWM an arm needs to hold its weight. Clamped by the integral limits. NaN is ignored.
+
+## Gains
+
+### `void setTunings(float kp, float ki, float kd)`
+Replaces the gains at runtime. **State is preserved and the switch is bumpless:** the I-term is stored in output units, so a new `ki` applies to future error only. Exception: `ki = 0` clears the I-term, because a frozen I-term would otherwise act as a hidden constant offset. Use one object and `setTunings()` per mode, not a new object (which discards the timer and the I-term).
+
+### `float getKp() const` / `getKi()` / `getKd()`
 Current gains.
 
-## `void setWindUP(float min, float max)`
-Clamp range for the **raw integral** (anti-windup). The clamp applies before multiplication by `ki`, so the I-term's max contribution to output is `ki * max_windup` — meaning the effective limit changes whenever you retune `ki`. Prefer `setIntegralLimit()` for new code. Arguments are swapped automatically if given in the wrong order.
+## Integral / anti-windup
 
-## `void setIntegralLimit(float min, float max)` *(new in 1.1.0)*
-Clamps the integral's **contribution to the output** (`ki * integral`) rather than the raw integral, so the limit keeps its meaning when `ki` is retuned. Applied on top of `setWindUP()` (both are enforced; the tighter one wins).
+### `void setConditionalIntegration(bool enabled)`
+On by default. While the output is past a constrain limit, a step that would push it further out is rolled back. Steps that unwind the saturation are never blocked. This fixes "the robot clips the corner, then overshoots coming out" when the motors sit at ±255 through a curve.
 
-Only active while `ki > 0` — with `ki == 0` the I-term contributes nothing anyway, and a negative `ki` would flip the interval. Arguments are swapped automatically if given in the wrong order. Pass `(0, 0)` to disable and fall back to `setWindUP()` alone.
+Only the constrain limits count as saturation, not `setOutputRampRate()`. While a ramp holds the output back, the I-term keeps integrating. Keep ramps short, or bound I with `setIntegralLimit()`.
 
-```cpp
-myPID.setIntegralLimit(-60, 60);  // I may never contribute more than ±60 of the ±255 output
-```
-
-## `void setConditionalIntegration(bool enabled)` *(new in 1.1.0)*
-Enabled by default. When on, the integration step is rolled back if the output is already past a constrain limit and that step pushed it further out. Integration that *unwinds* saturation is never blocked, so recovery is not delayed.
-
-This is the fix for the classic "robot clips the corner then overshoots coming out" symptom, where the motors sit at ±255 through a sharp curve. Turn it off only to A/B compare during tuning.
-
-## `void setMaxDeltaTime(unsigned long maxDtMs)`
-Caps the dt measured internally by the one-argument `compute(error)`. **Default 100 ms since 1.1.0** (was 1000 ms); pass 0 to disable the cap. A gap over the cap produces a resume sample (see `compute(error)` above). Does not affect `computeMs()` or the seconds-based `compute()`, where you supply dt yourself.
-
-## `void setSmoothingDerivative(float sD)` / alias `setSmoothingDerivate(float sD)`
-Exponential low-pass filter on the derivative term, with a **fixed coefficient**. `sD` is clamped to [0, 1]. 0 = no smoothing (default), values near 1 = heavy smoothing (more of the previous derivative, more lag). `setSmoothingDerivate` (misspelled) is a backwards-compatible alias — identical behavior.
-
-⚠️ **Trap:** the coefficient is fixed, so the filter's effective time constant scales with your loop period. If the loop rate jitters (SD writes, LCD updates, slow ToF reads), the amount of smoothing jitters with it. Measured: driving the same ramp for 200 ms of wall clock with `sD = 0.9` yields a filtered derivative of **87.8 at a 10 ms loop but 34.4 at 50 ms** — a 2.5× difference from loop timing alone. Prefer `setDerivativeTimeConstant()` on any robot whose loop period is not steady.
-
-## `void setDerivativeTimeConstant(float tauSeconds)` *(new in 1.1.0)*
-Same low-pass filter, but specified as a **time constant in seconds**. The coefficient becomes `tau / (tau + dt)`, recomputed from the measured `dt` on every call, so the amount of smoothing stays constant as the loop period moves. Over the same test as above, `tau = 0.1` yields **85.1 at a 10 ms loop and 80.2 at 50 ms**, both close to the analytic step response of 86.5.
-
-Pass 0 (or a negative value) to turn derivative filtering off entirely.
-
-Mutually exclusive with `setSmoothingDerivative()` — whichever was called last wins, in both directions.
-
-Picking a value: `tau` is roughly the time the filter takes to reach 63% of a step in the derivative. Start near 2–3× your nominal loop period (e.g. `0.05` for a 20 ms loop) and raise it if D is still noisy. To convert an existing fixed coefficient you already like: `tau = sD / (1 - sD) * dt`, using the loop period you tuned it at — `sD = 0.8` at a 20 ms loop is `tau = 0.08`.
-
-## `void setDampingFactor(float dF)`
-When the error **crosses zero** (strict sign change between consecutive calls), the integral is multiplied by `dF`. Values in **[0, 1]**: 1 = keep integral (default), 0 = wipe integral at every crossing, 0.5 = halve it. Since 1.0.6 the value is clamped to [0, 1].
-
-Note: with a noisy sensor hovering near zero error, the sign flips often and the integral is damped at every flip — this effectively suppresses the I-term near the setpoint. Usually harmless for wall following, but be aware if you rely on I to remove steady-state offset.
-
-## `float getP()` / `float getI()` / `float getD()` / `float getOutput()` *(new in 1.1.0)*
-Per-term contributions from the **last** `compute*()` call: `kp*error`, `ki*integral`, and `kd*derivative` respectively, after any conditional-integration rollback. `getP() + getI() + getD()` is the output *before* the constrain clamp; `getOutput()` is the value actually returned.
-
-Intended for tuning telemetry — printing the three terms tells you at a glance whether I is winding up or D is just amplifying sensor noise:
+### `void setIntegralLimit(float min, float max)`
+Clamps the I-term's contribution to the output, in output units. This keeps its meaning when `ki` changes. Arguments are swapped if reversed. `(0, 0)` disables it.
 
 ```cpp
-float out = myPID.compute(error);
-Serial.print(myPID.getP()); Serial.print('\t');
-Serial.print(myPID.getI()); Serial.print('\t');
-Serial.print(myPID.getD()); Serial.print('\t');
-Serial.println(myPID.getOutput());
+myPID.setIntegralLimit(-60, 60);  // I may never contribute more than ±60
 ```
 
-All four return 0 after `reset()` and before the first compute call.
+### `void setWindUP(float min, float max)`
+Legacy clamp on the **raw** integral (error × seconds). Its effect on the output is `ki × limit`, so it shifts whenever `ki` is retuned. Off by default since 1.2.0. Once called, it stays on for that object. Arguments are swapped if reversed. Prefer `setIntegralLimit()`.
+
+### `void setDampingFactor(float dF)`
+When the error **crosses zero** (strict sign change between calls), I is multiplied by `dF`, clamped to [0, 1]. 1 = keep (default), 0 = wipe at every crossing. With a noisy sensor near zero error the sign flips often, which suppresses I near the setpoint.
+
+## Output
+
+### `void setConstrain(float min, float max)`
+Output limits (default ±255). Arguments are swapped if reversed. Also bounds the I-term to ± the range width.
+
+### `void setMinOutput(float minOutput)` *(new in 1.2.0)*
+Motors often do not move below some PWM (~30–50), so a PID near its target stalls short of it. Nonzero outputs smaller than `minOutput` are raised to ±`minOutput`, **except while |error| is within `setTolerance()`'s error tolerance**. Without that band the robot hunts back and forth across the target, so pair the two. 0 disables.
+
+### `void setOutputRampRate(float unitsPerSecond)` *(new in 1.2.0)*
+Limits how fast the output may change: `1000` takes a 0…255 output from 0 to full in ~0.26 s. This prevents wheel spin, tipping, and brown-out resets from motor inrush. The first internally timed sample after `reset()` has no elapsed time, so the output soft-starts from 0. 0 disables.
+
+### `void setFeedforward(float kF, float kS = 0)` *(new in 1.2.0)*
+For `update*` only: adds `kF × setpoint + kS × sign(setpoint)`. For motor speed, `kS` is the PWM that just overcomes friction and `kF` is PWM per unit of speed above that. The PI loop then only corrects the remainder. It has no effect on `compute*`, which has no setpoint. `(0, 0)` disables (the default).
+
+## Derivative
+
+### `void setDerivativeTimeConstant(float tauSeconds)`
+Low-pass filters the derivative with a time constant in seconds. The coefficient `tau / (tau + dt)` is recomputed each call, so smoothing is the same whatever the loop rate. Measured: `tau = 0.1` gives 85.1 at a 10 ms loop and 80.2 at 50 ms, against an analytic 86.5. Start near 2–3× your loop period. 0 disables. It is mutually exclusive with `setSmoothingDerivative()`: the last call wins.
+
+### `void setSmoothingDerivative(float sD)` / alias `setSmoothingDerivate(float sD)`
+The same filter with a **fixed** coefficient in [0, 1]. Its effect scales with the loop period: `sD = 0.9` gives 87.8 at 10 ms and 34.4 at 50 ms. Prefer the time constant. To convert: `tau = sD / (1 − sD) × dt`.
+
+## Circular inputs
+
+### `void setContinuousInput(float min, float max)` / `void disableContinuousInput()` *(new in 1.2.0)*
+For gyro headings and other angles. The error, and the derivative's difference, are wrapped into ± half of `max − min`. Heading 350 → target 10 is **+20**, not −340. A 179 → −179 step is a 2° move, not 358°. Only the size of the range matters: `(-180, 180)` and `(0, 360)` behave the same. Works for accumulated headings of any size.
+
+## Finished yet?
+
+### `void setTolerance(float errorTol, float rateTol = -1, unsigned long settleMs = 0)` / `bool atSetpoint() const` *(new in 1.2.0)*
+`atSetpoint()` is true once **both** of these have held continuously for `settleMs`:
+- `|error| ≤ errorTol`
+- `|derivative| ≤ rateTol`: the filtered derivative, in error units per second. Negative = not checked.
+
+It is always false before `setTolerance()` and after `reset()`. A resume sample neither adds to nor breaks the settle time.
+
+```cpp
+pid.setTolerance(2.0, 15.0, 100);   // within 2°, slower than 15°/s, for 100 ms
+pid.reset();
+while (!pid.atSetpoint() && millis() - start < 3000) {
+  float p = pid.update(target, heading());
+  drive(p, -p);
+}
+```
+
+The rate check matters: a robot sweeping through the target at speed is inside the error band for a moment but not finished.
+
+## Timing
+
+### `void setMaxDeltaTime(unsigned long maxDtMs)`
+Longest gap between internally timed calls that still counts as a normal cycle (default 500 ms, 0 disables). A longer gap produces a resume sample. It does not affect the variants where you pass dt.
+
+### `float getDeltaTime() const` / `bool wasResumed() const` *(new in 1.2.0)*
+The dt (seconds) used by the last sample that ran, and whether that sample was a resume. Held calls change neither. **If `wasResumed()` is true on every loop, the loop is slower than `setMaxDeltaTime()` and I and D never act.**
+
+## Telemetry
+
+### `float getP() const` / `getI()` / `getD()` / `getF()` / `getOutput()`
+Terms from the **last** call: `kp×error`, the I-term, `kd×derivative`, and the feedforward. `getP() + getI() + getD() + getF()` is the output before min-output, ramp and clamp; `getOutput()` is what was returned. All are 0 after `reset()`.
+
+```cpp
+Serial.print(pid.getP()); Serial.print('\t');
+Serial.print(pid.getI()); Serial.print('\t');
+Serial.print(pid.getD()); Serial.print('\t');
+Serial.println(pid.getOutput());
+```
+
+Print at 115200 baud, and not every loop: at 9600 baud a single line can block the loop for tens of milliseconds.
+
+---
+
+## Cost on an Arduino Uno
+
+Measured in simavr on an ATmega328P at 16 MHz (no FPU), `-Os`:
+
+| Call | Cycles | Time |
+|---|---|---|
+| `computeMs()` PI only (`kd = 0`) | ~2,600 | ~165 µs |
+| `computeMs()` PID | ~3,450 | ~215 µs |
+| `computeMs()` PID + tau filter + integral limit | ~4,600 | ~290 µs |
+| `updateMs()` with every 1.2.0 feature on | ~7,350 | ~460 µs |
+
+RAM: 147 bytes per controller on AVR. Boards with an FPU (ESP32, Teensy 4, RP2350, STM32F4) are far faster.
 
 ---
 
 ## Host tests
 
-`extras/test/` holds a regression suite that builds and runs on a desktop compiler against a fake `millis()` clock — no board required:
+`extras/test/` holds a regression suite that builds and runs on a desktop compiler against a fake 32-bit `micros()` clock. No board is required:
 
 ```bash
 ./extras/test/run_tests.sh          # or .\extras\test\run_tests.ps1 on Windows
 ```
 
-36 checks covering every method, including two things that are impractical to verify on hardware: `millis()` rollover (once per ~49 days of uptime) and the loop-rate independence of the derivative filter. Non-zero exit on failure. `extras/` is ignored by the Arduino build system, so none of it reaches the board. See `extras/test/README.md`.
-
-Run it after any change to `src/`, and before a competition.
+102 checks. Non-zero exit on failure. CI also runs them under AddressSanitizer/UBSan and clang, runs `arduino-lint`, and compiles the examples for Uno, Mega, Raspberry Pi Pico and ESP32. See `extras/test/README.md`.
 
 ---
 
 ## Checklist for auditing robot code
 
-- [ ] **Never** calls the two-argument `compute(error, dt)` with milliseconds — use `computeMs()` (this is the single most damaging misuse).
-- [ ] Calls `reset()` after pauses (victim stop, kit drop) and before starting a new controlled motion (turn, new corridor) when using the `compute(error)` millis-based variant.
-- [ ] Integral bounded by `setIntegralLimit()` (output units) rather than a raw `setWindUP()` value that silently changes meaning when `ki` is retuned.
-- [ ] Conditional integration left enabled unless there is a measured reason to disable it.
-- [ ] Gain switching between modes uses `setTunings()` on one object, not a freshly constructed `PID` (which silently discards the integral and timer).
-- [ ] Loop rate is ≥ ~1 ms per iteration if using `compute(error)`, and the typical loop period is comfortably under `setMaxDeltaTime()` — otherwise normal cycles get misread as resumes and the I-term never accumulates.
-- [ ] Derivative filtering uses `setDerivativeTimeConstant()` rather than `setSmoothingDerivative()` if the loop period is not steady (SD writes, LCD updates, slow ToF reads).
-- [ ] Error convention is consistent: the library computes on the error you give it; sign of the output depends on your `error = measurement − setpoint` vs `setpoint − measurement` choice.
-- [ ] One `PID` object per controlled quantity (heading, wall distance, etc.) — state (integral, previous error, internal timer) is per-object.
+- [ ] **Never** calls the deprecated two-argument `compute(error, dt)` with a real loop dt — use `computeMs()` / `computeSeconds()`.
+- [ ] Controllers with a setpoint (turn to heading, wall distance, speed) use `update(setpoint, measurement)`, not `compute(setpoint - measurement)`, so a new target does not kick the D-term.
+- [ ] Heading controllers call `setContinuousInput(-180, 180)` (or `(0, 360)`).
+- [ ] "Turn finished" uses `setTolerance(…)` + `atSetpoint()` **with a timeout**, and includes a rate tolerance so the robot doesn't count sweeping through the target as done.
+- [ ] `setMinOutput()` is paired with `setTolerance()` so the robot does not hunt around the target.
+- [ ] Calls `reset()` before a new controlled motion and after planned pauses.
+- [ ] A lost line / sensor timeout (NaN) is handled by the robot logic: the PID holds its last output, it does not stop the motors.
+- [ ] `wasResumed()` is not true on every loop (loop slower than `setMaxDeltaTime()`).
+- [ ] Integral bounded with `setIntegralLimit()` (output units) rather than `setWindUP()`.
+- [ ] Conditional integration left on unless there is a measured reason to turn it off.
+- [ ] Mode switches use `setTunings()` on one object, not a freshly constructed one.
+- [ ] Derivative filtering uses `setDerivativeTimeConstant()` rather than `setSmoothingDerivative()` if the loop period varies.
+- [ ] Error sign convention is consistent: `update()` uses `setpoint − measurement`.
+- [ ] One object per controlled quantity (heading, wall distance, each wheel's speed).

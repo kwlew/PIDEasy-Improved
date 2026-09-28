@@ -3,16 +3,22 @@
 ## Original PIDEasy: https://github.com/vsjoaopedrovs/PIDEasy
 This library is a fork of the original PIDEasy library.
 
+A small PID library aimed at competition robots (RoboCup Junior, WRO, line followers, sumo): the parts every robot ends up writing by hand around a PID are built in and tested.
+
 ## 🚀 Features
-- Simple and lightweight
-- Measures `dt` automatically, or takes it from you in seconds or milliseconds
-- Runtime gain changes that keep the controller state (bumpless mode switching)
-- Saturation-aware anti-windup (conditional integration), plus windup limits
-- Integral limits expressed in output units, so they survive a `ki` retune
-- Derivative smoothing, either as a fixed coefficient or as a loop-rate-independent time constant
-- Allows output constraints
-- Per-term telemetry (`getP`/`getI`/`getD`) for tuning over serial
-- Host test suite that runs on your PC — no board needed
+- Simple and lightweight, all `float`, no dynamic memory
+- Measures `dt` itself with `micros()`, or takes it in seconds, milliseconds or microseconds
+- `update(setpoint, measurement)`: derivative on measurement, so a new target doesn't kick the D-term
+- Heading wrap-around for gyros (`setContinuousInput`): 350° → 10° turns 20°, not 340°
+- "Turn finished?" check (`setTolerance` + `atSetpoint`) with error, rate and settle time
+- Feedforward (`kF`, `kS`) for motor speed control
+- Motor deadband compensation (`setMinOutput`) and output ramp limiting (`setOutputRampRate`)
+- Saturation-aware anti-windup (conditional integration), integral limits in output units
+- Bumpless runtime gain changes (`setTunings`)
+- Loop-rate-independent derivative filtering
+- NaN-safe: a sensor glitch (like a 0/0 line position) holds the output instead of breaking the controller
+- Per-term telemetry (`getP`/`getI`/`getD`/`getF`) for tuning over serial
+- Host test suite (102 checks) and CI builds for Uno, Mega, Pico and ESP32
 
 ## 📥 Installation
 ### Arduino IDE (Manual Installation)
@@ -25,118 +31,116 @@ This library is a fork of the original PIDEasy library.
 4. Restart the Arduino IDE.
 5. Go to **Sketch** > **Include Library** > **Manage Libraries**, search for `PIDEasy-Improved`, and check if it's installed.
 
+### PlatformIO
+Add to `platformio.ini`:
+```ini
+lib_deps = https://github.com/kwlew/PIDEasy-Improved.git
+```
+
 ## 📖 Usage
 
-### 1️⃣ Include the Library
+### 1️⃣ Include the library and create a controller
 ```cpp
 #include <PIDEasy.h>
+
+PIDEasy myPID(1.0, 0.5, 0.1); // Kp, Ki, Kd  (the old name PID still works)
 ```
 
-### 2️⃣ Create a PID Controller
+### 2️⃣ Compute the output
+If you have a setpoint and a measurement (a heading, a distance, a speed), use `update()`:
 ```cpp
-PID myPID(1.0, 0.5, 0.1); // Kp, Ki, Kd
+float output = myPID.update(targetHeading, gyroHeading); // dt measured with micros()
 ```
 
-### 3️⃣ Compute the PID Output
-The library preserves the original API for backwards compatibility.
-
-
-- Backwards-compatible `compute(error, dt)` expects `dt` in seconds (original behavior). If you measure time with `millis()`, convert to seconds before calling:
+If you only have an error value (e.g. a line position), use `compute()`:
 ```cpp
-float error = desiredValue - actualValue;
-unsigned long dt_ms = millis() - lastTime;
-unsigned long dt_seconds = dt_ms / 1000UL; // integer seconds (original API uses unsigned long seconds)
-float control = myPID.compute(error, dt_seconds);
-lastTime = millis();
+float output = myPID.compute(linePosition); // error; dt measured with micros()
 ```
 
-- New: if you have `dt` in milliseconds, use `computeMs(error, dt_ms)`:
+Measuring dt yourself? Use `computeMs(error, dt_ms)`, `computeUs(error, dt_us)` or `computeSeconds(error, dt_s)`, and likewise `updateMs` / `updateUs` / `updateSeconds`.
+
+⚠️ The old two-argument `compute(error, dt)` takes dt in **whole seconds**, which is wrong for any robot loop. It is deprecated and kept only for old sketches.
+
+### 3️⃣ Output limits
 ```cpp
-unsigned long dt_ms = millis() - lastTime; // dt in ms
-float control = myPID.computeMs(error, dt_ms);
+myPID.setConstrain(-255.0, 255.0); // default
 ```
 
-- Convenience overload `compute(error)` uses `millis()` internally and calls the millisecond variant:
+### 4️⃣ Gyro turns: wrap-around and "finished"
 ```cpp
-float control = myPID.compute(error); // uses internal millis() to compute dt (ms)
+turnPID.setContinuousInput(-180, 180);   // headings wrap
+turnPID.setTolerance(2.0, 15.0, 100);    // within 2°, slower than 15°/s, for 100 ms
+turnPID.setMinOutput(40);                // wheels don't move below ~40 PWM
+
+turnPID.reset();
+unsigned long start = millis();
+while (!turnPID.atSetpoint() && millis() - start < 3000) {
+  float power = turnPID.update(target, readHeading());
+  drive(power, -power);
+}
 ```
+See `examples/gyroTurn`.
 
-### 4️⃣ Set Constraints (Optional)
+### 5️⃣ Motor speed: feedforward and ramping
 ```cpp
-myPID.setConstrain(-255.0, 255.0); // Limit output (float allowed)
+speedPID.setFeedforward(0.35, 25.0);  // kF * target + kS: most of the PWM, before any error
+speedPID.setOutputRampRate(500);      // max 500 PWM per second: no wheel spin, no brown-outs
+float pwm = speedPID.updateMs(targetSpeed, measuredSpeed, dt_ms);
 ```
+See `examples/motorSpeedFeedforward` for how to measure `kF` and `kS`.
 
-### 5️⃣ Enable Windup Prevention (Optional)
+### 6️⃣ Derivative smoothing
 ```cpp
-myPID.setWindUP(-255, 255);
+myPID.setDerivativeTimeConstant(0.05); // seconds; the same smoothing at any loop rate
 ```
+The older `setSmoothingDerivative(0.8)` (alias `setSmoothingDerivate`) uses a fixed coefficient, so its effect changes with the loop period. To convert: `tau = sD / (1 - sD) * dt`, so `sD = 0.8` on a 20 ms loop becomes `tau = 0.08`.
 
-### 6️⃣ Adjust Derivative Smoothing (Optional)
+### 7️⃣ Anti-windup
+Conditional integration is on by default: while the output is pinned at a limit, the integral stops charging up. This prevents the overshoot after a hard turn. To cap the I-term further, in output units:
 ```cpp
-myPID.setSmoothingDerivative(0.8); // preferred name
-// or the backwards-compatible alias:
-myPID.setSmoothingDerivate(0.8);
+myPID.setIntegralLimit(-60.0, 60.0); // I contributes at most ±60
 ```
+`setWindUP(min, max)` (a clamp on the raw integral) still works, but its effect changes whenever you retune `ki`.
 
-⚠️ This is a **fixed coefficient**, so how much it actually smooths depends on your loop
-period. If your loop time jitters (SD card writes, LCD updates, slow distance sensors),
-use a time constant in seconds instead — the coefficient is then recomputed from the
-measured `dt` every call and the smoothing stays put:
-
+### 8️⃣ Change gains at runtime
 ```cpp
-myPID.setDerivativeTimeConstant(0.05); // seconds; 0 disables filtering
+myPID.setTunings(2.0, 0.05, 0.4); // bumpless: the output doesn't jump
 ```
+Call `reset()` as well if you want a clean slate. `resetIntegral()` clears only the I-term.
 
-Converting a fixed value you already like: `tau = sD / (1 - sD) * dt` at the loop period
-you tuned it at, so `sD = 0.8` on a 20 ms loop becomes `tau = 0.08`. The two are mutually
-exclusive — whichever you call last wins.
-
-### 7️⃣ Adjust Damping Factor (Optional)
+### 9️⃣ Read the individual terms while tuning
 ```cpp
-myPID.setDampingFactor(0.8);
-```
-
-### 8️⃣ Change Gains at Runtime (Optional)
-`setTunings()` keeps the integral, derivative history, and internal timer, so switching
-modes mid-run is bumpless. Call `reset()` as well if you want a clean slate instead.
-```cpp
-myPID.setTunings(2.0, 0.05, 0.4); // e.g. switching from straight-line to curve gains
-float kp = myPID.getKp();         // getKi(), getKd() too
-```
-
-### 9️⃣ Bound the Integral in Output Units (Optional)
-`setWindUP()` clamps the raw integral, so its effective limit is `ki * windup` and changes
-whenever you retune `ki`. `setIntegralLimit()` clamps the I-term's actual contribution
-to the output instead:
-```cpp
-myPID.setIntegralLimit(-60.0, 60.0); // I contributes at most ±60 of the ±255 output
-myPID.setIntegralLimit(0, 0);        // disable, fall back to setWindUP()
-```
-
-### 🔟 Conditional Integration (On by Default)
-While the output is pinned at a constrain limit, the integral no longer keeps charging
-up — which is what otherwise causes an overshoot as the robot comes out of a hard turn.
-Integration that unwinds the saturation is never blocked.
-```cpp
-myPID.setConditionalIntegration(false); // opt out to compare during tuning
-```
-
-### 1️⃣1️⃣ Read the Individual Terms (Optional)
-Useful when tuning over the serial monitor — it shows immediately whether the I-term is
-winding up or the D-term is just amplifying sensor noise.
-```cpp
-float out = myPID.compute(error);
 Serial.print(myPID.getP()); Serial.print('\t');
 Serial.print(myPID.getI()); Serial.print('\t');
 Serial.print(myPID.getD()); Serial.print('\t');
 Serial.println(myPID.getOutput());
 ```
+Use 115200 baud and print a few times a second, not every loop.
 
-### 1️⃣2️⃣ Check example for more info.
+### 🔟 Check your loop timing
+```cpp
+if (myPID.wasResumed()) { /* this sample counted as a pause */ }
+float dt = myPID.getDeltaTime();  // seconds
+```
+Gaps longer than `setMaxDeltaTime()` (default 500 ms) count as a pause: the I and D terms skip that one sample. If `wasResumed()` is true on every loop, your loop is too slow for the cap.
+
+### Using PID_v1 in the same sketch
+```cpp
+#define PIDEASY_NO_PID_ALIAS   // frees the name PID for the other library
+#include <PIDEasy.h>
+#include <PID_v1.h>
+```
+
+### Examples
+- `lineFollowerExample`: analog sensor array, two motors, surviving a lost line
+- `gyroTurn`: turn to a heading, with wrap-around and a settle check
+- `motorSpeedFeedforward`: encoder speed control with feedforward and ramping
+
+Full details for every function are in [LIBRARY_REFERENCE.md](LIBRARY_REFERENCE.md).
 
 ## 🧪 Running the tests
 The controller has a regression suite that builds and runs on your **PC** against a fake
-`millis()` clock — no board, no upload. Run it after changing anything in `src/`, and
+`micros()` clock — no board, no upload. Run it after changing anything in `src/`, and
 before a competition:
 
 ```powershell
@@ -147,23 +151,23 @@ before a competition:
 ./extras/test/run_tests.sh
 ```
 
-36 checks, non-zero exit on failure. Needs `g++` (or any C++ compiler — set `CXX`).
+102 checks, non-zero exit on failure. Needs `g++` (or any C++ compiler — set `CXX`).
 Everything lives under `extras/`, which the Arduino build system ignores, so it never
 reaches the board. Details in [extras/test/README.md](extras/test/README.md).
 
-## ⚠️ Upgrading from 1.0.x
-Every existing signature still works, but two defaults changed in 1.1.0:
-- **Conditional integration is on by default** — restore the old behavior with `setConditionalIntegration(false)`.
-- **`setMaxDeltaTime()` defaults to 100 ms (was 1000 ms)**, and a gap longer than the cap now
-  skips the integral and derivative for that one sample rather than taking a full clamped step.
-  Restore roughly the old behavior with `setMaxDeltaTime(1000)`.
+## ⚠️ Upgrading
+Every existing sketch still compiles. Behavior changes in **1.2.0**:
+- `compute(error)` times itself with `micros()`: dt is accurate at 1–2 kHz, so the D-term is calmer.
+- `setTunings()` is bumpless (the output no longer jumps when `ki` changes), and `ki = 0` clears the I-term.
+- No raw windup clamp by default. The I-term is bounded by the width of the output range, and conditional integration keeps it in check. A small `ki` is no longer silently capped at `ki × 255`.
+- `setMaxDeltaTime()` defaults to 500 ms (was 100 ms).
 
-If you tuned your gains around the old windup behavior, re-check them.
-See [LIBRARY_REFERENCE.md](LIBRARY_REFERENCE.md) for full details.
+In **1.1.1**, NaN errors began holding the output, and calls with no elapsed time stopped counting as 1 ms. In **1.1.0**, conditional integration became the default, and long gaps became resumes.
+
+If you tuned your gains around the old behavior, re-check them. See [LIBRARY_REFERENCE.md](LIBRARY_REFERENCE.md) for details.
 
 ## 📜 License
 This project is licensed under the MIT License.
 
 ## 🤝 Contributing
 Feel free to contribute! Fork the repository and submit a pull request.
-

@@ -9,7 +9,7 @@
 #include "PIDEasy.h"
 
 // Backing store for the fake clock declared in the Arduino.h stub.
-unsigned long fake_clock_ms = 0;
+uint32_t fake_clock_us = 0;
 
 static int failures = 0;
 static int checks = 0;
@@ -38,13 +38,21 @@ static void test_tunings() {
   check("setTunings updates all three gains",
         near(p.getKp(), 4.0f) && near(p.getKi(), 5.0f) && near(p.getKd(), 6.0f));
 
-  // The integral must survive a gain change so mode switches stay bumpless.
+  // The I-term must survive a gain change without the output jumping, so
+  // mode switches stay bumpless.
   PID q(0.0f, 1.0f, 0.0f);
-  q.computeMs(10.0f, 1000);                     // integral = 10
-  const float before = q.getI();                // ki*I = 10
-  q.setTunings(0.0f, 2.0f, 0.0f);               // ki doubles, integral kept
-  const float after = q.computeMs(0.0f, 1000);  // integral still 10 -> out 20
-  check("setTunings preserves the integral", near(before, 10.0f) && near(after, 20.0f));
+  q.computeMs(10.0f, 1000);                     // I-term = 10
+  const float before = q.getI();
+  q.setTunings(0.0f, 2.0f, 0.0f);               // ki doubles
+  const float after = q.computeMs(0.0f, 1000);  // zero error: output unchanged
+  check("setTunings is bumpless (ki change keeps the output)",
+        near(before, 10.0f) && near(after, 10.0f));
+  q.computeMs(1.0f, 1000);                      // new ki applies to new error only
+  check("new ki applies to future error only", near(q.getI(), 12.0f));
+
+  q.setTunings(0.0f, 0.0f, 0.0f);
+  const float off = q.computeMs(5.0f, 1000);
+  check("setTunings with ki = 0 clears the I-term", near(q.getI(), 0.0f) && near(off, 0.0f));
 }
 
 // ---------------------------------------------------------------------------
@@ -103,14 +111,34 @@ static void test_integral_limit() {
   for (int i = 0; i < 1000; i++) s.computeMs(100.0f, 100);
   check("setIntegralLimit swaps reversed arguments", near(s.getI(), 60.0f, 1e-3f));
 
-  // Both limits are enforced; the tighter one wins. Default windup is +/-255
-  // raw, which with ki = 0.01 caps the I-term at 2.55 regardless of a looser
-  // integral limit.
+  // Both limits are enforced; the tighter one wins. A windup of +/-255 raw,
+  // with ki = 0.01, caps the I-term at 2.55 regardless of a looser integral
+  // limit.
   PID t(0.0f, 0.01f, 0.0f);
-  t.setIntegralLimit(-60.0f, 60.0f);   // 6000 raw, looser than default windup
+  t.setWindUP(-255.0f, 255.0f);
+  t.setIntegralLimit(-60.0f, 60.0f);   // 6000 raw, looser than the windup
   t.setConditionalIntegration(false);
   for (int i = 0; i < 500; i++) t.computeMs(100.0f, 100);
   check("windup limit still applies when tighter", near(t.getI(), 2.55f, 1e-3f));
+
+  // Default: no raw windup clamp, so a small ki is not silently capped at
+  // ki * 255. The I-term is bounded by the width of the output range instead.
+  PID u(0.0f, 0.05f, 0.0f);
+  u.setConditionalIntegration(false);
+  for (int i = 0; i < 60000; i++) u.computeMs(20.0f, 10);   // 0.01 per step
+  check("small ki is not capped by a default windup", u.getI() > 100.0f);
+  check("I-term bounded by the output range width", near(u.getI(), 510.0f, 1e-2f));
+  u.setConstrain(-100.0f, 100.0f);
+  u.computeMs(0.0f, 10);                                    // no new integration
+  check("narrowing the output range re-clamps the I-term", near(u.getI(), 200.0f));
+
+  // One-sided output range: the I-term must still be able to go negative
+  // to trim a feedforward that overshoots.
+  PID f(0.0f, 1.0f, 0.0f);
+  f.setConstrain(0.0f, 255.0f);
+  f.setFeedforward(1.0f, 0.0f);
+  for (int i = 0; i < 100; i++) f.updateMs(100.0f, 110.0f, 10);  // 10 too fast
+  check("one-sided range: I-term can go negative", f.getI() < -9.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -186,17 +214,277 @@ static void test_dt_and_resume() {
   setMillis(5000); q.compute(1.0f);
   check("setMaxDeltaTime(0) disables the cap", q.getI() > 4.0f);
 
-  // millis() rollover must not produce a huge or negative dt.
+  // micros() rollover (every ~71 minutes) must not produce a huge dt. The
+  // stub clock is 32 bits wide, so this wraps even on a 64-bit host.
   PID r(0.0f, 1.0f, 0.0f);
   r.setConstrain(-10000.0f, 10000.0f);
   r.setMaxDeltaTime(0);
-  setMillis(0xFFFFFFFFUL - 20UL);
+  setMicros(0xFFFFFFFFUL - 20000UL);
   r.compute(1.0f);
-  advanceMillis(40);            // wraps past zero
+  advanceMicros(40000);         // wraps past zero
   r.compute(1.0f);
-  check("millis() rollover yields a sane dt", near(r.getI(), 0.040f, 1e-3f));
+  check("micros() rollover yields a sane dt", near(r.getI(), 0.040f, 1e-4f) &&
+        near(r.getDeltaTime(), 0.040f, 1e-6f));
+
+  // Diagnostics: a slow loop (over the cap) shows up in wasResumed().
+  PID d(0.0f, 1.0f, 0.0f);
+  setMillis(0);  d.compute(1.0f);
+  check("first sample reports a resume", d.wasResumed());
+  setMillis(20); d.compute(1.0f);
+  check("normal sample reports its dt", !d.wasResumed() && near(d.getDeltaTime(), 0.020f, 1e-6f));
+  d.setMaxDeltaTime(100);
+  setMillis(140); d.compute(1.0f);
+  check("over-cap gap reports a resume", d.wasResumed() && near(d.getDeltaTime(), 0.100f, 1e-6f));
+
+  // Default cap is 500 ms: a slow 120 ms maze loop must still integrate.
+  PID m(0.0f, 1.0f, 0.0f);
+  setMillis(0); m.compute(5.0f);
+  for (int i = 1; i <= 50; i++) { setMillis(i * 120UL); m.compute(5.0f); }
+  check("120 ms loop integrates under the default cap", near(m.getI(), 30.0f, 1e-2f));
+
+  // compute(error) resolves sub-millisecond loop periods with micros().
+  PID j(0.0f, 0.0f, 1.0f);
+  j.setConstrain(-1e6f, 1e6f);
+  setMicros(0); j.compute(0.0f);
+  float lo = 1e9f, hi = -1e9f;
+  for (int i = 1; i <= 200; i++) {
+    setMicros(i * 1500UL);                 // 1.5 ms loop, true rate 100/s
+    j.compute(100.0f * i * 0.0015f);
+    if (j.getD() < lo) lo = j.getD();
+    if (j.getD() > hi) hi = j.getD();
+  }
+  char buf[64];
+  snprintf(buf, sizeof buf, "(D %.2f .. %.2f)", lo, hi);
+  check("1.5 ms loop derivative is not quantized", lo > 99.0f && hi < 101.0f, buf);
 
   setMillis(0);                 // leave the clock tidy for later tests
+}
+
+// ---------------------------------------------------------------------------
+// Setpoint / measurement API
+// ---------------------------------------------------------------------------
+static void test_update() {
+  section("update(setpoint, measurement)");
+
+  // A heading target step must not kick the D-term.
+  PID p(2.0f, 0.0f, 0.5f);
+  p.setConstrain(-1e6f, 1e6f);
+  p.updateMs(0.0f, 0.0f, 10);
+  p.updateMs(90.0f, 0.0f, 10);
+  check("setpoint step gives no derivative kick", near(p.getD(), 0.0f));
+  check("error is setpoint - measurement", near(p.getP(), 180.0f));
+
+  PID e(2.0f, 0.0f, 0.5f);
+  e.setConstrain(-1e6f, 1e6f);
+  e.computeMs(0.0f, 10);
+  e.computeMs(90.0f, 10);
+  check("compute(error) still kicks (for comparison)", near(e.getD(), 4500.0f, 1e-1f));
+
+  // With a fixed setpoint, the measurement derivative matches the error one.
+  PID a(0.0f, 0.0f, 1.0f), b(0.0f, 0.0f, 1.0f);
+  a.setConstrain(-1e6f, 1e6f);
+  b.setConstrain(-1e6f, 1e6f);
+  a.updateMs(10.0f, 0.0f, 10);  b.computeMs(10.0f, 10);
+  a.updateMs(10.0f, 2.0f, 10);  b.computeMs(8.0f, 10);
+  check("fixed setpoint: same D as compute(error)", near(a.getD(), b.getD()) && near(a.getD(), -200.0f));
+
+  // Internal timer is shared with compute(error).
+  PID t(0.0f, 1.0f, 0.0f);
+  setMillis(0);  t.update(1.0f, 0.0f);
+  setMillis(50); t.update(1.0f, 0.0f);
+  check("update() uses the internal timer", near(t.getI(), 0.050f, 1e-4f));
+
+  PID z(1.0f, 0.0f, 0.0f);
+  z.updateMs(5.0f, 0.0f, 10);
+  check("updateMs with dt = 0 holds", near(z.updateMs(50.0f, 0.0f, 0), 5.0f));
+  check("NaN measurement holds", near(z.updateMs(5.0f, nanf(""), 10), 5.0f));
+
+  PID u(0.0f, 1.0f, 0.0f);
+  u.updateUs(1.0f, 0.0f, 250);
+  check("updateUs integrates microseconds", near(u.getI(), 0.00025f, 1e-7f));
+  PID c(0.0f, 1.0f, 0.0f);
+  c.computeUs(1.0f, 250);
+  check("computeUs integrates microseconds", near(c.getI(), 0.00025f, 1e-7f) &&
+        near(c.computeUs(9.0f, 0), c.getOutput()));
+
+  setMillis(0);
+}
+
+// ---------------------------------------------------------------------------
+// Competition helpers
+// ---------------------------------------------------------------------------
+static void test_continuous_input() {
+  section("setContinuousInput");
+
+  // Heading 350 -> target 10 is +20 degrees, not -340.
+  PID p(1.0f, 0.0f, 0.0f);
+  p.setContinuousInput(0.0f, 360.0f);
+  check("350 -> 10 degrees turns +20", near(p.updateMs(10.0f, 350.0f, 10), 20.0f));
+  check("10 -> 350 degrees turns -20", near(p.updateMs(350.0f, 10.0f, 10), -20.0f));
+
+  PID e(1.0f, 0.0f, 0.0f);
+  e.setContinuousInput(-180.0f, 180.0f);
+  check("compute(error) wraps the error too", near(e.computeMs(-340.0f, 10), 20.0f));
+  check("many turns still wrap", near(e.computeMs(3600.0f + 30.0f, 10), 30.0f, 1e-2f));
+
+  // The derivative across the wrap point is the short way round.
+  PID d(0.0f, 0.0f, 1.0f);
+  d.setConstrain(-1e6f, 1e6f);
+  d.setContinuousInput(-180.0f, 180.0f);
+  d.updateMs(0.0f, 179.0f, 10);
+  d.updateMs(0.0f, -179.0f, 10);         // measurement moved +2 degrees
+  check("derivative across 180/-180 is the short way", near(d.getD(), -200.0f, 1e-2f));
+
+  PID off(1.0f, 0.0f, 0.0f);
+  off.setConstrain(-1000.0f, 1000.0f);
+  off.setContinuousInput(0.0f, 360.0f);
+  off.disableContinuousInput();
+  check("disableContinuousInput restores raw error", near(off.updateMs(10.0f, 350.0f, 10), -340.0f));
+}
+
+static void test_tolerance() {
+  section("setTolerance / atSetpoint");
+
+  PID p(1.0f, 0.0f, 0.0f);
+  check("atSetpoint false before setTolerance", !p.atSetpoint());
+  p.setTolerance(2.0f, -1.0f, 100);
+  p.updateMs(90.0f, 80.0f, 10);
+  check("outside the error band", !p.atSetpoint());
+  for (int i = 0; i < 9; i++) p.updateMs(90.0f, 89.0f, 10);   // 90 ms inside
+  check("inside but not settled long enough", !p.atSetpoint());
+  p.updateMs(90.0f, 89.0f, 10);                               // 100 ms
+  check("settled after settleMs", p.atSetpoint());
+  p.updateMs(90.0f, 85.0f, 10);
+  check("leaving the band resets the settle time", !p.atSetpoint());
+  p.updateMs(90.0f, 89.0f, 10);
+  check("settle time restarts from zero", !p.atSetpoint());
+
+  // Rate tolerance: still sweeping through the target is not "done".
+  PID r(1.0f, 0.0f, 0.0f);
+  r.setTolerance(2.0f, 10.0f, 0);
+  r.updateMs(90.0f, 88.5f, 10);
+  r.updateMs(90.0f, 89.5f, 10);          // moving at 100 deg/s
+  check("fast sweep through the target is not atSetpoint", !r.atSetpoint());
+  r.updateMs(90.0f, 89.55f, 10);         // 5 deg/s
+  check("slow inside the band is atSetpoint", r.atSetpoint());
+
+  r.reset();
+  check("reset clears atSetpoint", !r.atSetpoint());
+}
+
+static void test_feedforward_and_shaping() {
+  section("setFeedforward / setMinOutput / setOutputRampRate");
+
+  PID f(0.0f, 0.0f, 0.0f);
+  f.setFeedforward(0.5f, 20.0f);
+  check("feedforward kF*sp + kS*sign(sp)", near(f.updateMs(100.0f, 100.0f, 10), 70.0f) &&
+        near(f.getF(), 70.0f));
+  check("kS follows the setpoint sign", near(f.updateMs(-100.0f, -100.0f, 10), -70.0f));
+  check("zero setpoint gives zero feedforward", near(f.updateMs(0.0f, 0.0f, 10), 0.0f));
+  check("feedforward does not apply to compute()", near(f.computeMs(0.0f, 10), 0.0f));
+
+  // Minimum output lifts small outputs, but not inside the tolerance band.
+  PID m(1.0f, 0.0f, 0.0f);
+  m.setMinOutput(40.0f);
+  check("small output lifted to minOutput", near(m.computeMs(5.0f, 10), 40.0f));
+  check("negative small output lifted too", near(m.computeMs(-5.0f, 10), -40.0f));
+  check("large output unchanged", near(m.computeMs(100.0f, 10), 100.0f));
+  check("zero output stays zero", near(m.computeMs(0.0f, 10), 0.0f));
+  m.setTolerance(2.0f);
+  check("no lift inside the tolerance band", near(m.computeMs(1.5f, 10), 1.5f));
+  check("lift outside the tolerance band", near(m.computeMs(3.0f, 10), 40.0f));
+
+  // Ramp: 1000 units/s at 10 ms -> 10 per sample.
+  PID r(1.0f, 0.0f, 0.0f);
+  r.setOutputRampRate(1000.0f);
+  check("ramp limits the first step", near(r.computeMs(255.0f, 10), 10.0f));
+  check("ramp limits each step", near(r.computeMs(255.0f, 10), 20.0f));
+  for (int i = 0; i < 30; i++) r.computeMs(255.0f, 10);
+  check("ramp reaches the target", near(r.getOutput(), 255.0f));
+  check("ramp limits going down too", near(r.computeMs(-255.0f, 10), 245.0f));
+  r.reset();
+  setMillis(0);
+  check("first internally timed sample after reset soft-starts at 0",
+        near(r.compute(255.0f), 0.0f));
+  setMillis(10);
+  check("then ramps with measured dt", near(r.compute(255.0f), 10.0f, 1e-3f));
+  setMillis(0);
+}
+
+static void test_seconds_and_integral_helpers() {
+  section("computeSeconds / resetIntegral / setIntegral");
+
+  PID s(0.0f, 1.0f, 0.0f);
+  check("computeSeconds takes float seconds", near(s.computeSeconds(10.0f, 0.02f), 0.2f));
+  check("computeSeconds dt <= 0 holds", near(s.computeSeconds(10.0f, 0.0f), 0.2f) &&
+        near(s.computeSeconds(10.0f, -1.0f), 0.2f) &&
+        near(s.computeSeconds(10.0f, nanf("")), 0.2f));
+  PID u(0.0f, 1.0f, 0.0f);
+  check("updateSeconds takes float seconds", near(u.updateSeconds(10.0f, 0.0f, 0.02f), 0.2f));
+
+  PID p(0.0f, 1.0f, 1.0f);
+  p.setConstrain(-1000.0f, 1000.0f);
+  p.computeMs(10.0f, 1000);
+  p.resetIntegral();
+  p.computeMs(10.0f, 1000);              // derivative history kept: d = 0
+  check("resetIntegral clears only the I-term", near(p.getI(), 10.0f) && near(p.getD(), 0.0f));
+
+  PID h(0.0f, 1.0f, 0.0f);
+  h.setIntegral(80.0f);
+  check("setIntegral preloads the I-term", near(h.computeMs(0.0f, 10), 80.0f));
+  h.setIntegralLimit(-50.0f, 50.0f);
+  h.setIntegral(80.0f);
+  check("setIntegral respects the integral limit", near(h.computeMs(0.0f, 10), 50.0f));
+}
+
+// ---------------------------------------------------------------------------
+// Robustness: non-finite input, sub-millisecond loops
+// ---------------------------------------------------------------------------
+static void test_robustness() {
+  section("non-finite error / sub-millisecond loop");
+
+  // A line position computed as 0/0 (all sensors white) must not latch NaN
+  // into the integral and kill the controller for the rest of the run.
+  const float nan_error = nanf("");
+  const float inf_error = INFINITY;
+  PID p(1.0f, 1.0f, 1.0f);
+  p.setConstrain(-1000.0f, 1000.0f);
+  p.computeMs(5.0f, 10);
+  const float held = p.computeMs(5.0f, 10);
+  check("NaN error holds the last output", near(p.computeMs(nan_error, 10), held));
+  check("infinite error holds the last output", near(p.computeMs(inf_error, 10), held));
+  const float after = p.computeMs(5.0f, 10);
+  check("controller keeps working after NaN / inf", after == after && near(after, held + 0.05f, 1e-3f));
+
+  // NaN through the millis() path must not consume elapsed time.
+  PID q(0.0f, 1.0f, 0.0f);
+  q.setConstrain(-1000.0f, 1000.0f);
+  setMillis(0);  q.compute(1.0f);
+  setMillis(20); q.compute(nan_error);
+  setMillis(40); q.compute(1.0f);
+  check("NaN sample does not swallow elapsed time", near(q.getI(), 0.040f, 1e-4f));
+
+  // Four calls per millisecond: the I-term must integrate real time, not
+  // one forced millisecond per call.
+  PID r(0.0f, 1.0f, 0.0f);
+  r.setConstrain(-1000.0f, 1000.0f);
+  setMillis(0);
+  r.compute(1.0f);
+  for (unsigned long ms = 1; ms <= 1000; ms++) {
+    setMillis(ms);
+    for (int k = 0; k < 4; k++) r.compute(1.0f);
+  }
+  char buf[64];
+  snprintf(buf, sizeof buf, "(I = %.3f)", r.getI());
+  check("4 kHz loop integrates real time, not per call", near(r.getI(), 1.0f, 1e-3f), buf);
+
+  // The first compute(error) call has no elapsed time to integrate.
+  PID s(0.0f, 1.0f, 0.0f);
+  setMillis(0);
+  s.compute(10.0f);
+  check("first compute(error) does not integrate", near(s.getI(), 0.0f));
+
+  setMillis(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +569,14 @@ static void test_backwards_compatibility() {
   section("backwards compatibility");
 
   PID p(1.0f, 0.0f, 0.0f);
+  // Deprecated, but it must keep working for existing sketches.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   check("compute(error, dt) seconds overload unchanged", near(p.compute(10.0f, 2UL), 10.0f));
+  PID p2(0.0f, 1.0f, 0.0f);
+  p2.compute(10.0f, 0UL);                // 0 still counts as 1 second
+#pragma GCC diagnostic pop
+  check("compute(error, 0) still treats dt as 1 s", near(p2.getI(), 10.0f));
 
   PID q(0.0f, 1.0f, 0.0f);
   check("computeMs still integrates in ms", near(q.computeMs(10.0f, 500), 5.0f));
@@ -308,6 +603,27 @@ static void test_backwards_compatibility() {
   check("setConstrain swaps reversed arguments", near(u.computeMs(100.0f, 100), 10.0f));
 }
 
+// ---------------------------------------------------------------------------
+// API shape
+// ---------------------------------------------------------------------------
+static float read_terms(const PIDEasy& pid) {
+  // Must compile: the getters are const.
+  return pid.getP() + pid.getI() + pid.getD() + pid.getF() + pid.getOutput() +
+         pid.getKp() + pid.getKi() + pid.getKd() + pid.getDeltaTime() +
+         (pid.wasResumed() ? 1.0f : 0.0f) + (pid.atSetpoint() ? 1.0f : 0.0f);
+}
+
+static void test_api() {
+  section("API shape");
+
+  PIDEasy p(1.0f, 0.0f, 0.0f);
+  p.computeMs(3.0f, 10);
+  // P 3 + output 3 + Kp 1 + dt 0.01; everything else is 0.
+  check("getters work through a const reference", near(read_terms(p), 7.01f));
+  PID& alias = p;                        // PID is an alias for PIDEasy
+  check("PID alias names the same class", near(alias.getOutput(), 3.0f));
+}
+
 int main() {
   printf("PIDEasy-Improved host test suite\n");
 
@@ -316,8 +632,15 @@ int main() {
   test_integral_limit();
   test_conditional_integration();
   test_dt_and_resume();
+  test_robustness();
+  test_update();
+  test_continuous_input();
+  test_tolerance();
+  test_feedforward_and_shaping();
+  test_seconds_and_integral_helpers();
   test_derivative_filter();
   test_backwards_compatibility();
+  test_api();
 
   printf("\n%s — %d checks, %d failure%s\n",
          failures ? "FAILURES" : "ALL PASS", checks, failures, failures == 1 ? "" : "s");
