@@ -303,6 +303,133 @@ static void test_update() {
 }
 
 // ---------------------------------------------------------------------------
+// Competition helpers
+// ---------------------------------------------------------------------------
+static void test_continuous_input() {
+  section("setContinuousInput");
+
+  // Heading 350 -> target 10 is +20 degrees, not -340.
+  PID p(1.0f, 0.0f, 0.0f);
+  p.setContinuousInput(0.0f, 360.0f);
+  check("350 -> 10 degrees turns +20", near(p.updateMs(10.0f, 350.0f, 10), 20.0f));
+  check("10 -> 350 degrees turns -20", near(p.updateMs(350.0f, 10.0f, 10), -20.0f));
+
+  PID e(1.0f, 0.0f, 0.0f);
+  e.setContinuousInput(-180.0f, 180.0f);
+  check("compute(error) wraps the error too", near(e.computeMs(-340.0f, 10), 20.0f));
+  check("many turns still wrap", near(e.computeMs(3600.0f + 30.0f, 10), 30.0f, 1e-2f));
+
+  // The derivative across the wrap point is the short way round.
+  PID d(0.0f, 0.0f, 1.0f);
+  d.setConstrain(-1e6f, 1e6f);
+  d.setContinuousInput(-180.0f, 180.0f);
+  d.updateMs(0.0f, 179.0f, 10);
+  d.updateMs(0.0f, -179.0f, 10);         // measurement moved +2 degrees
+  check("derivative across 180/-180 is the short way", near(d.getD(), -200.0f, 1e-2f));
+
+  PID off(1.0f, 0.0f, 0.0f);
+  off.setConstrain(-1000.0f, 1000.0f);
+  off.setContinuousInput(0.0f, 360.0f);
+  off.disableContinuousInput();
+  check("disableContinuousInput restores raw error", near(off.updateMs(10.0f, 350.0f, 10), -340.0f));
+}
+
+static void test_tolerance() {
+  section("setTolerance / atSetpoint");
+
+  PID p(1.0f, 0.0f, 0.0f);
+  check("atSetpoint false before setTolerance", !p.atSetpoint());
+  p.setTolerance(2.0f, -1.0f, 100);
+  p.updateMs(90.0f, 80.0f, 10);
+  check("outside the error band", !p.atSetpoint());
+  for (int i = 0; i < 9; i++) p.updateMs(90.0f, 89.0f, 10);   // 90 ms inside
+  check("inside but not settled long enough", !p.atSetpoint());
+  p.updateMs(90.0f, 89.0f, 10);                               // 100 ms
+  check("settled after settleMs", p.atSetpoint());
+  p.updateMs(90.0f, 85.0f, 10);
+  check("leaving the band resets the settle time", !p.atSetpoint());
+  p.updateMs(90.0f, 89.0f, 10);
+  check("settle time restarts from zero", !p.atSetpoint());
+
+  // Rate tolerance: still sweeping through the target is not "done".
+  PID r(1.0f, 0.0f, 0.0f);
+  r.setTolerance(2.0f, 10.0f, 0);
+  r.updateMs(90.0f, 88.5f, 10);
+  r.updateMs(90.0f, 89.5f, 10);          // moving at 100 deg/s
+  check("fast sweep through the target is not atSetpoint", !r.atSetpoint());
+  r.updateMs(90.0f, 89.55f, 10);         // 5 deg/s
+  check("slow inside the band is atSetpoint", r.atSetpoint());
+
+  r.reset();
+  check("reset clears atSetpoint", !r.atSetpoint());
+}
+
+static void test_feedforward_and_shaping() {
+  section("setFeedforward / setMinOutput / setOutputRampRate");
+
+  PID f(0.0f, 0.0f, 0.0f);
+  f.setFeedforward(0.5f, 20.0f);
+  check("feedforward kF*sp + kS*sign(sp)", near(f.updateMs(100.0f, 100.0f, 10), 70.0f) &&
+        near(f.getF(), 70.0f));
+  check("kS follows the setpoint sign", near(f.updateMs(-100.0f, -100.0f, 10), -70.0f));
+  check("zero setpoint gives zero feedforward", near(f.updateMs(0.0f, 0.0f, 10), 0.0f));
+  check("feedforward does not apply to compute()", near(f.computeMs(0.0f, 10), 0.0f));
+
+  // Minimum output lifts small outputs, but not inside the tolerance band.
+  PID m(1.0f, 0.0f, 0.0f);
+  m.setMinOutput(40.0f);
+  check("small output lifted to minOutput", near(m.computeMs(5.0f, 10), 40.0f));
+  check("negative small output lifted too", near(m.computeMs(-5.0f, 10), -40.0f));
+  check("large output unchanged", near(m.computeMs(100.0f, 10), 100.0f));
+  check("zero output stays zero", near(m.computeMs(0.0f, 10), 0.0f));
+  m.setTolerance(2.0f);
+  check("no lift inside the tolerance band", near(m.computeMs(1.5f, 10), 1.5f));
+  check("lift outside the tolerance band", near(m.computeMs(3.0f, 10), 40.0f));
+
+  // Ramp: 1000 units/s at 10 ms -> 10 per sample.
+  PID r(1.0f, 0.0f, 0.0f);
+  r.setOutputRampRate(1000.0f);
+  check("ramp limits the first step", near(r.computeMs(255.0f, 10), 10.0f));
+  check("ramp limits each step", near(r.computeMs(255.0f, 10), 20.0f));
+  for (int i = 0; i < 30; i++) r.computeMs(255.0f, 10);
+  check("ramp reaches the target", near(r.getOutput(), 255.0f));
+  check("ramp limits going down too", near(r.computeMs(-255.0f, 10), 245.0f));
+  r.reset();
+  setMillis(0);
+  check("first internally timed sample after reset soft-starts at 0",
+        near(r.compute(255.0f), 0.0f));
+  setMillis(10);
+  check("then ramps with measured dt", near(r.compute(255.0f), 10.0f, 1e-3f));
+  setMillis(0);
+}
+
+static void test_seconds_and_integral_helpers() {
+  section("computeSeconds / resetIntegral / setIntegral");
+
+  PID s(0.0f, 1.0f, 0.0f);
+  check("computeSeconds takes float seconds", near(s.computeSeconds(10.0f, 0.02f), 0.2f));
+  check("computeSeconds dt <= 0 holds", near(s.computeSeconds(10.0f, 0.0f), 0.2f) &&
+        near(s.computeSeconds(10.0f, -1.0f), 0.2f) &&
+        near(s.computeSeconds(10.0f, nanf("")), 0.2f));
+  PID u(0.0f, 1.0f, 0.0f);
+  check("updateSeconds takes float seconds", near(u.updateSeconds(10.0f, 0.0f, 0.02f), 0.2f));
+
+  PID p(0.0f, 1.0f, 1.0f);
+  p.setConstrain(-1000.0f, 1000.0f);
+  p.computeMs(10.0f, 1000);
+  p.resetIntegral();
+  p.computeMs(10.0f, 1000);              // derivative history kept: d = 0
+  check("resetIntegral clears only the I-term", near(p.getI(), 10.0f) && near(p.getD(), 0.0f));
+
+  PID h(0.0f, 1.0f, 0.0f);
+  h.setIntegral(80.0f);
+  check("setIntegral preloads the I-term", near(h.computeMs(0.0f, 10), 80.0f));
+  h.setIntegralLimit(-50.0f, 50.0f);
+  h.setIntegral(80.0f);
+  check("setIntegral respects the integral limit", near(h.computeMs(0.0f, 10), 50.0f));
+}
+
+// ---------------------------------------------------------------------------
 // Robustness: non-finite input, sub-millisecond loops
 // ---------------------------------------------------------------------------
 static void test_robustness() {
@@ -434,7 +561,14 @@ static void test_backwards_compatibility() {
   section("backwards compatibility");
 
   PID p(1.0f, 0.0f, 0.0f);
+  // Deprecated, but it must keep working for existing sketches.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   check("compute(error, dt) seconds overload unchanged", near(p.compute(10.0f, 2UL), 10.0f));
+  PID p2(0.0f, 1.0f, 0.0f);
+  p2.compute(10.0f, 0UL);                // 0 still counts as 1 second
+#pragma GCC diagnostic pop
+  check("compute(error, 0) still treats dt as 1 s", near(p2.getI(), 10.0f));
 
   PID q(0.0f, 1.0f, 0.0f);
   check("computeMs still integrates in ms", near(q.computeMs(10.0f, 500), 5.0f));
@@ -471,6 +605,10 @@ int main() {
   test_dt_and_resume();
   test_robustness();
   test_update();
+  test_continuous_input();
+  test_tolerance();
+  test_feedforward_and_shaping();
+  test_seconds_and_integral_helpers();
   test_derivative_filter();
   test_backwards_compatibility();
 
