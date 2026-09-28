@@ -147,7 +147,7 @@ before a competition:
 ./extras/test/run_tests.sh
 ```
 
-36 checks, non-zero exit on failure. Needs `g++` (or any C++ compiler — set `CXX`).
+42 checks, non-zero exit on failure. Needs `g++` (or any C++ compiler — set `CXX`).
 Everything lives under `extras/`, which the Arduino build system ignores, so it never
 reaches the board. Details in [extras/test/README.md](extras/test/README.md).
 

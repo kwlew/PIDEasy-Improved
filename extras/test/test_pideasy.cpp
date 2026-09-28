@@ -200,6 +200,56 @@ static void test_dt_and_resume() {
 }
 
 // ---------------------------------------------------------------------------
+// Robustness: non-finite input, sub-millisecond loops
+// ---------------------------------------------------------------------------
+static void test_robustness() {
+  section("non-finite error / sub-millisecond loop");
+
+  // A line position computed as 0/0 (all sensors white) must not latch NaN
+  // into the integral and kill the controller for the rest of the run.
+  const float nan_error = nanf("");
+  const float inf_error = INFINITY;
+  PID p(1.0f, 1.0f, 1.0f);
+  p.setConstrain(-1000.0f, 1000.0f);
+  p.computeMs(5.0f, 10);
+  const float held = p.computeMs(5.0f, 10);
+  check("NaN error holds the last output", near(p.computeMs(nan_error, 10), held));
+  check("infinite error holds the last output", near(p.computeMs(inf_error, 10), held));
+  const float after = p.computeMs(5.0f, 10);
+  check("controller keeps working after NaN / inf", after == after && near(after, held + 0.05f, 1e-3f));
+
+  // NaN through the millis() path must not consume elapsed time.
+  PID q(0.0f, 1.0f, 0.0f);
+  q.setConstrain(-1000.0f, 1000.0f);
+  setMillis(0);  q.compute(1.0f);
+  setMillis(20); q.compute(nan_error);
+  setMillis(40); q.compute(1.0f);
+  check("NaN sample does not swallow elapsed time", near(q.getI(), 0.040f, 1e-4f));
+
+  // Four calls per millisecond: the I-term must integrate real time, not
+  // one forced millisecond per call.
+  PID r(0.0f, 1.0f, 0.0f);
+  r.setConstrain(-1000.0f, 1000.0f);
+  setMillis(0);
+  r.compute(1.0f);
+  for (unsigned long ms = 1; ms <= 1000; ms++) {
+    setMillis(ms);
+    for (int k = 0; k < 4; k++) r.compute(1.0f);
+  }
+  char buf[64];
+  snprintf(buf, sizeof buf, "(I = %.3f)", r.getI());
+  check("4 kHz loop integrates real time, not per call", near(r.getI(), 1.0f, 1e-3f), buf);
+
+  // The first compute(error) call has no elapsed time to integrate.
+  PID s(0.0f, 1.0f, 0.0f);
+  setMillis(0);
+  s.compute(10.0f);
+  check("first compute(error) does not integrate", near(s.getI(), 0.0f));
+
+  setMillis(0);
+}
+
+// ---------------------------------------------------------------------------
 // Derivative filtering: fixed coefficient vs time constant
 // ---------------------------------------------------------------------------
 
@@ -316,6 +366,7 @@ int main() {
   test_integral_limit();
   test_conditional_integration();
   test_dt_and_resume();
+  test_robustness();
   test_derivative_filter();
   test_backwards_compatibility();
 

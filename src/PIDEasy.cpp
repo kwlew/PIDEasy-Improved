@@ -35,6 +35,13 @@ static float constrainFloat(float x, float a, float b) {
   return x;
 }
 
+// Internal helper: false for NaN and +/-infinity. NaN fails x == x, and an
+// infinity fails x - x == 0 (inf - inf is NaN). Avoids relying on isfinite(),
+// which is a macro on some cores and a std:: function on others.
+static bool isFiniteFloat(float x) {
+  return (x == x) && (x - x == 0.0f);
+}
+
 // Clamp the integral to the windup limits, then (if enabled) to the limit
 // expressed in output units. Dividing by ki converts that bound back into a
 // bound on the raw integral; skipped when ki is not positive, where the
@@ -48,6 +55,11 @@ void PID::applyIntegralLimits() {
 
 // Shared implementation for every compute variant. dt is in milliseconds.
 float PID::computeInternal(float error, unsigned long dt_ms, bool resume) {
+  // A non-finite error (e.g. a line position computed as 0/0 when every
+  // sensor reads white) would otherwise latch NaN into the integral and
+  // disable the controller until reset(). Hold the last output instead.
+  if (!isFiniteFloat(error)) return last_output;
+
   // Convert dt to seconds for internal calculations
   const float dt = (dt_ms == 0) ? 0.001f : (dt_ms / 1000.0f);
 
@@ -126,24 +138,33 @@ float PID::compute(const float error, const unsigned long dt) {
 
 // Compute using millis() to determine dt. First call initializes internal timer.
 float PID::compute(const float error) {
+  // Checked here as well as in computeInternal() so a rejected sample does
+  // not consume elapsed time: the next valid sample then sees the true gap.
+  if (!isFiniteFloat(error)) return last_output;
+
   const unsigned long now = millis();
-  unsigned long dt_ms = 0;
-  bool resume = false;
   if (!hasLastMillis) {
+    // No time has elapsed yet, so there is nothing to integrate or
+    // differentiate: treat the first sample as a resume.
     hasLastMillis = true;
     lastMillis = now;
-    dt_ms = 1; // small non-zero dt
-  } else {
-    dt_ms = now - lastMillis;
-    lastMillis = now;
-    if (dt_ms == 0) dt_ms = 1;
-    // A pause longer than the cap (e.g. robot stopped to signal a victim)
-    // makes the integral and derivative for this sample meaningless, so
-    // treat it as a resume rather than accumulating one giant step.
-    if (max_dt_ms > 0 && dt_ms > max_dt_ms) {
-      dt_ms = max_dt_ms;
-      resume = true;
-    }
+    return computeInternal(error, 1, true);
+  }
+
+  unsigned long dt_ms = now - lastMillis;
+  // Called again within the same millisecond: no measurable time has passed.
+  // Forcing dt to 1 ms here would integrate 1 ms per call and, on a loop
+  // faster than 1 kHz, make the I-term grow several times too fast.
+  if (dt_ms == 0) return last_output;
+  lastMillis = now;
+
+  // A pause longer than the cap (e.g. robot stopped to signal a victim)
+  // makes the integral and derivative for this sample meaningless, so
+  // treat it as a resume rather than accumulating one giant step.
+  bool resume = false;
+  if (max_dt_ms > 0 && dt_ms > max_dt_ms) {
+    dt_ms = max_dt_ms;
+    resume = true;
   }
   return computeInternal(error, dt_ms, resume);
 }

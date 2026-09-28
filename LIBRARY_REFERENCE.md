@@ -1,7 +1,7 @@
 # PIDEasy-Improved — Library Reference
 
 Reference for auditing robot code that uses this library (RoboCup Junior Rescue Maze).
-Covers version 1.1.0. One class: `PID`, declared in `src/PIDEasy.h`, implemented in `src/PIDEasy.cpp`.
+Covers version 1.1.1. One class: `PID`, declared in `src/PIDEasy.h`, implemented in `src/PIDEasy.cpp`.
 
 ## ⚠️ Behavior changes in 1.1.0
 
@@ -16,6 +16,7 @@ Both changes only affect the one-argument `compute(error)` (change 2) and any ca
 
 Each `compute*` call does, in order:
 
+0. If `error` is NaN or infinite, the call returns the previous output and changes nothing *(since 1.1.1)*.
 1. `integral += error * dt` (dt internally in **seconds**), then clamps `integral` to the windup limits and, if enabled, to the output-unit integral limit. **Skipped entirely on a resume sample.**
 2. If `error` changed sign versus the previous call (strictly positive → strictly negative or vice versa), multiplies `integral` by `dampingFactor`.
 3. Derivative = `(error - previous_error) / dt`, **forced to 0 on the very first sample** after construction or `reset()`, and on a resume sample (avoids derivative kick). Then low-pass filtered: `d = smoothing * previous_d + (1 - smoothing) * d`, where `smoothing` is either the fixed coefficient from `setSmoothingDerivative()` or `tau / (tau + dt)` when `setDerivativeTimeConstant()` is in use.
@@ -57,11 +58,11 @@ Backwards-compatible with the original PIDEasy. `dt` is an **integer number of s
 The correct variant when you measure dt yourself. `dt_ms == 0` is treated as 1 ms. Never produces a resume sample — you own the timing here.
 
 ### `float compute(float error)` — dt measured internally with `millis()`
-First call initializes the internal timer and uses dt = 1 ms (derivative is suppressed anyway on the first sample). Subsequent calls use elapsed `millis()`. Handles `millis()` rollover correctly (unsigned subtraction).
+First call initializes the internal timer and is treated as a resume: no time has elapsed, so neither the integral nor the derivative is updated. Subsequent calls use elapsed `millis()`. A call in the same millisecond as the previous one returns the previous output unchanged *(since 1.1.1; previously it counted as a full 1 ms, which made the I-term grow several times too fast on loops above 1 kHz)*. Handles `millis()` rollover correctly (unsigned subtraction).
 
 If the measured gap exceeds `setMaxDeltaTime()` (default 100 ms), the sample is treated as a **resume**: the integral is left untouched and the derivative is forced to 0 for that call. Normal behavior returns on the next in-window sample. Calling `reset()` after a pause is still the cleaner option when you also want the accumulated integral cleared.
 
-⚠️ **Trap:** if the loop runs **faster than 1 kHz**, dt clamps to 1 ms while real dt is shorter → derivative is over-estimated and jittery. Add a small delay or use `computeMs` with `micros()`-derived timing if your loop is that fast.
+⚠️ **Trap:** `millis()` only counts whole milliseconds, so at 1–2 kHz the measured dt alternates between 1 and 2 ms and the derivative jitters by up to ±50%.
 
 ## `void reset()`
 Clears integral, previous error, previous derivative, the first-sample flag, the internal `millis()` timer, and the telemetry getters. **Call this whenever the setpoint changes discontinuously** (start of a turn, new wall-follow segment, after a pause). Because the derivative acts on *error*, a sudden setpoint change otherwise produces a one-cycle derivative kick.
@@ -138,13 +139,15 @@ All four return 0 after `reset()` and before the first compute call.
 ./extras/test/run_tests.sh          # or .\extras\test\run_tests.ps1 on Windows
 ```
 
-36 checks covering every method, including two things that are impractical to verify on hardware: `millis()` rollover (once per ~49 days of uptime) and the loop-rate independence of the derivative filter. Non-zero exit on failure. `extras/` is ignored by the Arduino build system, so none of it reaches the board. See `extras/test/README.md`.
+42 checks covering every method, including two things that are impractical to verify on hardware: `millis()` rollover (once per ~49 days of uptime) and the loop-rate independence of the derivative filter. Non-zero exit on failure. `extras/` is ignored by the Arduino build system, so none of it reaches the board. See `extras/test/README.md`.
 
 Run it after any change to `src/`, and before a competition.
 
 ---
 
 ## Checklist for auditing robot code
+
+- [ ] A sensor glitch (NaN / infinite error) no longer breaks the controller, but it still holds the last output — make sure the robot's own logic handles a lost line or a sensor timeout.
 
 - [ ] **Never** calls the two-argument `compute(error, dt)` with milliseconds — use `computeMs()` (this is the single most damaging misuse).
 - [ ] Calls `reset()` after pauses (victim stop, kit drop) and before starting a new controlled motion (turn, new corridor) when using the `compute(error)` millis-based variant.

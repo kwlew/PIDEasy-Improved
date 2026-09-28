@@ -60,6 +60,7 @@ If the library ever needs another Arduino symbol, add it to the stub.
 | `setIntegralLimit` | caps the I-term in output units; survives a `ki` retune; disable; argument swapping; windup still wins when tighter |
 | Conditional integration | holds the integral down while saturated; recovers sooner; never blocks integration that unwinds saturation |
 | dt / resume | resume skips integral and derivative; normal cycles resume; cap disable; **`millis()` rollover** |
+| Robustness | NaN / infinite error holds the output and does not consume elapsed time; a 4 kHz loop integrates real time; the first sample does not integrate |
 | Derivative filter | fixed coefficient is loop-rate dependent (the bug); time constant is not; matches the analytic step response; mode switching both ways |
 | Backwards compatibility | seconds overload, `computeMs`, constrain, sign-change damping, the misspelled `setSmoothingDerivate` alias, argument swapping |
 
