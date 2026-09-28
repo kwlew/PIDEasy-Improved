@@ -9,7 +9,7 @@
 #include "PIDEasy.h"
 
 // Backing store for the fake clock declared in the Arduino.h stub.
-unsigned long fake_clock_ms = 0;
+uint32_t fake_clock_us = 0;
 
 static int failures = 0;
 static int checks = 0;
@@ -38,13 +38,21 @@ static void test_tunings() {
   check("setTunings updates all three gains",
         near(p.getKp(), 4.0f) && near(p.getKi(), 5.0f) && near(p.getKd(), 6.0f));
 
-  // The integral must survive a gain change so mode switches stay bumpless.
+  // The I-term must survive a gain change without the output jumping, so
+  // mode switches stay bumpless.
   PID q(0.0f, 1.0f, 0.0f);
-  q.computeMs(10.0f, 1000);                     // integral = 10
-  const float before = q.getI();                // ki*I = 10
-  q.setTunings(0.0f, 2.0f, 0.0f);               // ki doubles, integral kept
-  const float after = q.computeMs(0.0f, 1000);  // integral still 10 -> out 20
-  check("setTunings preserves the integral", near(before, 10.0f) && near(after, 20.0f));
+  q.computeMs(10.0f, 1000);                     // I-term = 10
+  const float before = q.getI();
+  q.setTunings(0.0f, 2.0f, 0.0f);               // ki doubles
+  const float after = q.computeMs(0.0f, 1000);  // zero error: output unchanged
+  check("setTunings is bumpless (ki change keeps the output)",
+        near(before, 10.0f) && near(after, 10.0f));
+  q.computeMs(1.0f, 1000);                      // new ki applies to new error only
+  check("new ki applies to future error only", near(q.getI(), 12.0f));
+
+  q.setTunings(0.0f, 0.0f, 0.0f);
+  const float off = q.computeMs(5.0f, 1000);
+  check("setTunings with ki = 0 clears the I-term", near(q.getI(), 0.0f) && near(off, 0.0f));
 }
 
 // ---------------------------------------------------------------------------
@@ -103,14 +111,26 @@ static void test_integral_limit() {
   for (int i = 0; i < 1000; i++) s.computeMs(100.0f, 100);
   check("setIntegralLimit swaps reversed arguments", near(s.getI(), 60.0f, 1e-3f));
 
-  // Both limits are enforced; the tighter one wins. Default windup is +/-255
-  // raw, which with ki = 0.01 caps the I-term at 2.55 regardless of a looser
-  // integral limit.
+  // Both limits are enforced; the tighter one wins. A windup of +/-255 raw,
+  // with ki = 0.01, caps the I-term at 2.55 regardless of a looser integral
+  // limit.
   PID t(0.0f, 0.01f, 0.0f);
-  t.setIntegralLimit(-60.0f, 60.0f);   // 6000 raw, looser than default windup
+  t.setWindUP(-255.0f, 255.0f);
+  t.setIntegralLimit(-60.0f, 60.0f);   // 6000 raw, looser than the windup
   t.setConditionalIntegration(false);
   for (int i = 0; i < 500; i++) t.computeMs(100.0f, 100);
   check("windup limit still applies when tighter", near(t.getI(), 2.55f, 1e-3f));
+
+  // Default: no raw windup clamp, so a small ki is not silently capped at
+  // ki * 255. The I-term alone is kept inside the output range instead.
+  PID u(0.0f, 0.05f, 0.0f);
+  u.setConditionalIntegration(false);
+  for (int i = 0; i < 30000; i++) u.computeMs(20.0f, 10);   // 0.01 per step
+  check("small ki is not capped by a default windup", u.getI() > 100.0f);
+  check("I-term alone never exceeds the output range", near(u.getI(), 255.0f));
+  u.setConstrain(-100.0f, 100.0f);
+  u.computeMs(0.0f, 10);                                    // no new integration
+  check("narrowing the output range re-clamps the I-term", near(u.getI(), 100.0f));
 }
 
 // ---------------------------------------------------------------------------
@@ -186,17 +206,100 @@ static void test_dt_and_resume() {
   setMillis(5000); q.compute(1.0f);
   check("setMaxDeltaTime(0) disables the cap", q.getI() > 4.0f);
 
-  // millis() rollover must not produce a huge or negative dt.
+  // micros() rollover (every ~71 minutes) must not produce a huge dt. The
+  // stub clock is 32 bits wide, so this wraps even on a 64-bit host.
   PID r(0.0f, 1.0f, 0.0f);
   r.setConstrain(-10000.0f, 10000.0f);
   r.setMaxDeltaTime(0);
-  setMillis(0xFFFFFFFFUL - 20UL);
+  setMicros(0xFFFFFFFFUL - 20000UL);
   r.compute(1.0f);
-  advanceMillis(40);            // wraps past zero
+  advanceMicros(40000);         // wraps past zero
   r.compute(1.0f);
-  check("millis() rollover yields a sane dt", near(r.getI(), 0.040f, 1e-3f));
+  check("micros() rollover yields a sane dt", near(r.getI(), 0.040f, 1e-4f) &&
+        near(r.getDeltaTime(), 0.040f, 1e-6f));
+
+  // Diagnostics: a slow loop (over the cap) shows up in wasResumed().
+  PID d(0.0f, 1.0f, 0.0f);
+  setMillis(0);  d.compute(1.0f);
+  check("first sample reports a resume", d.wasResumed());
+  setMillis(20); d.compute(1.0f);
+  check("normal sample reports its dt", !d.wasResumed() && near(d.getDeltaTime(), 0.020f, 1e-6f));
+  d.setMaxDeltaTime(100);
+  setMillis(140); d.compute(1.0f);
+  check("over-cap gap reports a resume", d.wasResumed() && near(d.getDeltaTime(), 0.100f, 1e-6f));
+
+  // Default cap is 500 ms: a slow 120 ms maze loop must still integrate.
+  PID m(0.0f, 1.0f, 0.0f);
+  setMillis(0); m.compute(5.0f);
+  for (int i = 1; i <= 50; i++) { setMillis(i * 120UL); m.compute(5.0f); }
+  check("120 ms loop integrates under the default cap", near(m.getI(), 30.0f, 1e-2f));
+
+  // compute(error) resolves sub-millisecond loop periods with micros().
+  PID j(0.0f, 0.0f, 1.0f);
+  j.setConstrain(-1e6f, 1e6f);
+  setMicros(0); j.compute(0.0f);
+  float lo = 1e9f, hi = -1e9f;
+  for (int i = 1; i <= 200; i++) {
+    setMicros(i * 1500UL);                 // 1.5 ms loop, true rate 100/s
+    j.compute(100.0f * i * 0.0015f);
+    if (j.getD() < lo) lo = j.getD();
+    if (j.getD() > hi) hi = j.getD();
+  }
+  char buf[64];
+  snprintf(buf, sizeof buf, "(D %.2f .. %.2f)", lo, hi);
+  check("1.5 ms loop derivative is not quantized", lo > 99.0f && hi < 101.0f, buf);
 
   setMillis(0);                 // leave the clock tidy for later tests
+}
+
+// ---------------------------------------------------------------------------
+// Setpoint / measurement API
+// ---------------------------------------------------------------------------
+static void test_update() {
+  section("update(setpoint, measurement)");
+
+  // A heading target step must not kick the D-term.
+  PID p(2.0f, 0.0f, 0.5f);
+  p.setConstrain(-1e6f, 1e6f);
+  p.updateMs(0.0f, 0.0f, 10);
+  p.updateMs(90.0f, 0.0f, 10);
+  check("setpoint step gives no derivative kick", near(p.getD(), 0.0f));
+  check("error is setpoint - measurement", near(p.getP(), 180.0f));
+
+  PID e(2.0f, 0.0f, 0.5f);
+  e.setConstrain(-1e6f, 1e6f);
+  e.computeMs(0.0f, 10);
+  e.computeMs(90.0f, 10);
+  check("compute(error) still kicks (for comparison)", near(e.getD(), 4500.0f, 1e-1f));
+
+  // With a fixed setpoint, the measurement derivative matches the error one.
+  PID a(0.0f, 0.0f, 1.0f), b(0.0f, 0.0f, 1.0f);
+  a.setConstrain(-1e6f, 1e6f);
+  b.setConstrain(-1e6f, 1e6f);
+  a.updateMs(10.0f, 0.0f, 10);  b.computeMs(10.0f, 10);
+  a.updateMs(10.0f, 2.0f, 10);  b.computeMs(8.0f, 10);
+  check("fixed setpoint: same D as compute(error)", near(a.getD(), b.getD()) && near(a.getD(), -200.0f));
+
+  // Internal timer is shared with compute(error).
+  PID t(0.0f, 1.0f, 0.0f);
+  setMillis(0);  t.update(1.0f, 0.0f);
+  setMillis(50); t.update(1.0f, 0.0f);
+  check("update() uses the internal timer", near(t.getI(), 0.050f, 1e-4f));
+
+  PID z(1.0f, 0.0f, 0.0f);
+  z.updateMs(5.0f, 0.0f, 10);
+  check("updateMs with dt = 0 holds", near(z.updateMs(50.0f, 0.0f, 0), 5.0f));
+  check("NaN measurement holds", near(z.updateMs(5.0f, nanf(""), 10), 5.0f));
+
+  PID u(0.0f, 1.0f, 0.0f);
+  u.updateUs(1.0f, 0.0f, 250);
+  check("updateUs integrates microseconds", near(u.getI(), 0.00025f, 1e-7f));
+  PID c(0.0f, 1.0f, 0.0f);
+  c.computeUs(1.0f, 250);
+  check("computeUs integrates microseconds", near(c.getI(), 0.00025f, 1e-7f) &&
+        near(c.computeUs(9.0f, 0), c.getOutput()));
+
+  setMillis(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +470,7 @@ int main() {
   test_conditional_integration();
   test_dt_and_resume();
   test_robustness();
+  test_update();
   test_derivative_filter();
   test_backwards_compatibility();
 
