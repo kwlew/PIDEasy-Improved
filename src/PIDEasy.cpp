@@ -11,8 +11,8 @@ PIDEasy::PIDEasy(const float kp, const float ki, const float kd) {
   previous_input = 0.0f;
   previous_derivative = 0.0f;
   i_term = 0.0f;
-  // No raw windup clamp by default: the I-term is kept inside the output
-  // range instead, which does not silently shrink when ki is small.
+  // No raw windup clamp by default: the I-term is bounded by the width of
+  // the output range instead, which does not silently shrink when ki is small.
   min_windup = 0.0f;
   max_windup = 0.0f;
   windup_enabled = false;
