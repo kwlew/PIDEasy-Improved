@@ -1,0 +1,26 @@
+{
+  "name": "PIDEasy-Improved",
+  "version": "1.2.0",
+  "description": "A simple, robust PID controller for Arduino robots: micros() timing, derivative on measurement, heading wrap-around, settle check, feedforward, deadband and ramp limits, anti-windup, NaN-safe inputs.",
+  "keywords": "pid, control, robotics, motor, line-follower, gyro",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kwlew/PIDEasy-Improved.git"
+  },
+  "authors": [
+    {
+      "name": "Kaleo S. Mendonça",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "frameworks": "arduino",
+  "platforms": "*",
+  "headers": "PIDEasy.h",
+  "export": {
+    "exclude": [
+      "extras",
+      ".github"
+    ]
+  }
+}

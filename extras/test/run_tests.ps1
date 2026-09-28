@@ -19,5 +19,9 @@ $exe = Join-Path $dir "test_pideasy.exe"
     (Join-Path $dir "test_pideasy.cpp") (Join-Path $src "PIDEasy.cpp") -o $exe
 if ($LASTEXITCODE -ne 0) { Write-Error "Compilation failed." }
 
+# The PIDEASY_NO_PID_ALIAS opt-out must leave the name PID free.
+& $cxx -std=c++11 -Wall -Wextra -fsyntax-only -I $dir -I $src (Join-Path $dir "no_alias_check.cpp")
+if ($LASTEXITCODE -ne 0) { Write-Error "PIDEASY_NO_PID_ALIAS check failed." }
+
 & $exe
 exit $LASTEXITCODE

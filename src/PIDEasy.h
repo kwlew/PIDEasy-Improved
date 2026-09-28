@@ -10,10 +10,15 @@
 #define PIDEASY_DEPRECATED(msg)
 #endif
 
-class PID {
+// The class was called PID before 1.2.0, and PID remains an alias for it (see
+// the end of this file). PID_v1 and other libraries also define a class
+// called PID; to use one of them in the same sketch, put
+//   #define PIDEASY_NO_PID_ALIAS
+// before #include <PIDEasy.h> and use the name PIDEasy.
+class PIDEasy {
   public:
     // Constructor: Kp, Ki, Kd
-    PID(float kp = 0.0, float ki = 0.0, float kd = 0.0);
+    PIDEasy(float kp = 0.0, float ki = 0.0, float kd = 0.0);
 
     // (original library used seconds). Use this to avoid breaking existing sketches.
     // dt is a whole number of seconds and 0 counts as 1 s, so any dt from a
@@ -63,14 +68,15 @@ class PID {
     // the output jump. Setting ki to 0 clears the I-term.
     void setTunings(float kp, float ki, float kd);
 
-    float getKp();
-    float getKi();
-    float getKd();
+    float getKp() const;
+    float getKi() const;
+    float getKd() const;
 
     // Clamp the raw integral (error x seconds) to [min, max]. Its effect on
     // the output is ki * limit, so it changes whenever ki is retuned; prefer
-    // setIntegralLimit(). Off by default: the I-term is always kept inside
-    // the setConstrain() range, which is enough for most robots.
+    // setIntegralLimit(). Off by default: the I-term is always kept within
+    // +/- the width of the setConstrain() range, which with conditional
+    // integration is enough for most robots.
     void setWindUP(float min, float max);
 
     // Limit the integral's *contribution to the output* (ki * integral)
@@ -122,7 +128,7 @@ class PID {
 
     // True when the last samples satisfied setTolerance(). Always false
     // until setTolerance() has been called, and after reset().
-    bool atSetpoint();
+    bool atSetpoint() const;
 
     // Feedforward for the setpoint / measurement variants (update*()):
     // adds kF * setpoint + kS * sign(setpoint) to the output. For motor
@@ -153,20 +159,20 @@ class PID {
     // getP() + getI() + getD() + getF() is the output before
     // setMinOutput(), setOutputRampRate() and the constrain clamp;
     // getOutput() is the value actually returned by the last compute*().
-    float getP();
-    float getI();
-    float getD();
-    float getOutput();
+    float getP() const;
+    float getI() const;
+    float getD() const;
+    float getOutput() const;
     // Feedforward contribution of the last update*() call.
-    float getF();
+    float getF() const;
 
     // Timing diagnostics for the last sample that ran. getDeltaTime() is the
     // dt it used, in seconds; wasResumed() is true when it was treated as a
     // resume (first sample, or a gap longer than setMaxDeltaTime()). If
     // wasResumed() is true on every loop, the loop is slower than the cap
     // and the I and D terms never act.
-    float getDeltaTime();
-    bool wasResumed();
+    float getDeltaTime() const;
+    bool wasResumed() const;
 
   private:
     // Where the derivative is taken from.
@@ -223,10 +229,12 @@ class PID {
     // True once a valid previous_input exists; used to suppress the
     // derivative term on the first sample (avoids a derivative "kick").
     bool hasPreviousInput;
-    DerivativeSource previous_source;
+    uint8_t previous_source; // a DerivativeSource, stored in one byte
 
     // For the internally timed compute(error) / update().
-    float continuous_min, continuous_max;
+    // max - min of the circular range, and its inverse so wrapping needs
+    // no division.
+    float continuous_range, continuous_inv_range;
     bool continuous_enabled;
 
     float error_tolerance, rate_tolerance, settle_s;
@@ -243,5 +251,9 @@ class PID {
     bool hasLastMicros;
     unsigned long max_dt_ms;
 };
+
+#ifndef PIDEASY_NO_PID_ALIAS
+typedef PIDEasy PID;
+#endif
 
 #endif

@@ -122,15 +122,23 @@ static void test_integral_limit() {
   check("windup limit still applies when tighter", near(t.getI(), 2.55f, 1e-3f));
 
   // Default: no raw windup clamp, so a small ki is not silently capped at
-  // ki * 255. The I-term alone is kept inside the output range instead.
+  // ki * 255. The I-term is bounded by the width of the output range instead.
   PID u(0.0f, 0.05f, 0.0f);
   u.setConditionalIntegration(false);
-  for (int i = 0; i < 30000; i++) u.computeMs(20.0f, 10);   // 0.01 per step
+  for (int i = 0; i < 60000; i++) u.computeMs(20.0f, 10);   // 0.01 per step
   check("small ki is not capped by a default windup", u.getI() > 100.0f);
-  check("I-term alone never exceeds the output range", near(u.getI(), 255.0f));
+  check("I-term bounded by the output range width", near(u.getI(), 510.0f, 1e-2f));
   u.setConstrain(-100.0f, 100.0f);
   u.computeMs(0.0f, 10);                                    // no new integration
-  check("narrowing the output range re-clamps the I-term", near(u.getI(), 100.0f));
+  check("narrowing the output range re-clamps the I-term", near(u.getI(), 200.0f));
+
+  // One-sided output range: the I-term must still be able to go negative
+  // to trim a feedforward that overshoots.
+  PID f(0.0f, 1.0f, 0.0f);
+  f.setConstrain(0.0f, 255.0f);
+  f.setFeedforward(1.0f, 0.0f);
+  for (int i = 0; i < 100; i++) f.updateMs(100.0f, 110.0f, 10);  // 10 too fast
+  check("one-sided range: I-term can go negative", f.getI() < -9.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +603,27 @@ static void test_backwards_compatibility() {
   check("setConstrain swaps reversed arguments", near(u.computeMs(100.0f, 100), 10.0f));
 }
 
+// ---------------------------------------------------------------------------
+// API shape
+// ---------------------------------------------------------------------------
+static float read_terms(const PIDEasy& pid) {
+  // Must compile: the getters are const.
+  return pid.getP() + pid.getI() + pid.getD() + pid.getF() + pid.getOutput() +
+         pid.getKp() + pid.getKi() + pid.getKd() + pid.getDeltaTime() +
+         (pid.wasResumed() ? 1.0f : 0.0f) + (pid.atSetpoint() ? 1.0f : 0.0f);
+}
+
+static void test_api() {
+  section("API shape");
+
+  PIDEasy p(1.0f, 0.0f, 0.0f);
+  p.computeMs(3.0f, 10);
+  // P 3 + output 3 + Kp 1 + dt 0.01; everything else is 0.
+  check("getters work through a const reference", near(read_terms(p), 7.01f));
+  PID& alias = p;                        // PID is an alias for PIDEasy
+  check("PID alias names the same class", near(alias.getOutput(), 3.0f));
+}
+
 int main() {
   printf("PIDEasy-Improved host test suite\n");
 
@@ -611,6 +640,7 @@ int main() {
   test_seconds_and_integral_helpers();
   test_derivative_filter();
   test_backwards_compatibility();
+  test_api();
 
   printf("\n%s — %d checks, %d failure%s\n",
          failures ? "FAILURES" : "ALL PASS", checks, failures, failures == 1 ? "" : "s");
