@@ -18,7 +18,7 @@ A small PID library aimed at competition robots (RoboCup Junior, WRO, line follo
 - Loop-rate-independent derivative filtering
 - NaN-safe: a sensor glitch (like a 0/0 line position) holds the output instead of breaking the controller
 - Per-term telemetry (`getP`/`getI`/`getD`/`getF`) for tuning over serial
-- Host test suite (102 checks) and CI builds for Uno, Mega, Pico and ESP32
+- Host regression suite and CI builds for Uno, Mega, Pico and ESP32
 
 ## 📥 Installation
 ### Arduino IDE (Manual Installation)
@@ -151,7 +151,7 @@ before a competition:
 ./extras/test/run_tests.sh
 ```
 
-102 checks, non-zero exit on failure. Needs `g++` (or any C++ compiler — set `CXX`).
+The runner exits non-zero on failure. Needs `g++` (or any C++ compiler — set `CXX`).
 Everything lives under `extras/`, which the Arduino build system ignores, so it never
 reaches the board. Details in [extras/test/README.md](extras/test/README.md).
 

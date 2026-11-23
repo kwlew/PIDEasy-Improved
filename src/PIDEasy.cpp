@@ -18,11 +18,9 @@ PIDEasy::PIDEasy(const float kp, const float ki, const float kd) {
   windup_enabled = false;
   min_integral_out = 0.0f;
   max_integral_out = 0.0f;
-  integral_limit_enabled = false;
-  setConstrain(-255.0f, 255.0f); // after the limit flags: it re-applies them
+  setConstrain(-255.0f, 255.0f); // derives the initial I-term bounds
   conditional_integration = true;
-  derivative_smoothing = 0.0f; // no smoothing by default (0=no smoothing, 1=full smoothing)
-  derivative_tau = 0.0f;
+  derivative_filter = 0.0f; // no smoothing by default
   use_tau_filter = false;
   dampingFactor = 1.0f;
   last_p = 0.0f;
@@ -31,11 +29,9 @@ PIDEasy::PIDEasy(const float kp, const float ki, const float kd) {
   last_output = 0.0f;
   last_dt = 0.0f;
   last_resumed = false;
-  hasPreviousInput = false;
-  previous_source = SOURCE_ERROR;
+  previous_source = SOURCE_NONE;
   continuous_range = 0.0f;
   continuous_enabled = false;
-  continuous_inv_range = 0.0f;
   error_tolerance = 0.0f;
   rate_tolerance = -1.0f;
   settle_s = 0.0f;
@@ -44,12 +40,13 @@ PIDEasy::PIDEasy(const float kp, const float ki, const float kd) {
   settled_time = 0.0f;
   kf = 0.0f;
   ks = 0.0f;
+  feedforward_enabled = false;
   last_f = 0.0f;
   min_output = 0.0f;
   ramp_rate = 0.0f;
   lastMicros = 0;
   hasLastMicros = false;
-  max_dt_ms = 500; // gaps longer than this are treated as a resume
+  setMaxDeltaTime(500); // gaps longer than this are treated as a resume
 }
 
 // Internal helper: constrain float between min and max
@@ -75,57 +72,77 @@ static bool isFiniteFloat(float x) {
 // still go negative to trim a feedforward that overshoots. The raw windup
 // clamp (scaled by ki into output units) and the output-unit integral limit
 // apply on top when enabled.
-void PIDEasy::applyIntegralLimits() {
+void PIDEasy::refreshIntegralLimits() {
   const float width = max_constrain - min_constrain;
-  i_term = constrainFloat(i_term, -width, width);
+  // Composing ordered clamps is equivalent to clamping once between the
+  // images of the two endpoints. This also preserves the legacy order when
+  // one-sided limits are disjoint (both endpoints map to the same value).
+  integral_min = width >= 0.0f ? -width : -INFINITY;
+  integral_max = width >= 0.0f ? width : INFINITY;
   if (windup_enabled && ki != 0.0f) {
     float lo = ki * min_windup;
     float hi = ki * max_windup;
     if (lo > hi) { const float tmp = lo; lo = hi; hi = tmp; } // negative ki
-    i_term = constrainFloat(i_term, lo, hi);
+    integral_min = constrainFloat(integral_min, lo, hi);
+    integral_max = constrainFloat(integral_max, lo, hi);
   }
-  if (integral_limit_enabled) {
-    i_term = constrainFloat(i_term, min_integral_out, max_integral_out);
+  if (min_integral_out != 0.0f || max_integral_out != 0.0f) {
+    integral_min = constrainFloat(integral_min, min_integral_out, max_integral_out);
+    integral_max = constrainFloat(integral_max, min_integral_out, max_integral_out);
   }
+  i_term = constrainFloat(i_term, integral_min, integral_max);
+  integral_step_needed = ki != 0.0f || integral_min > 0.0f || integral_max < 0.0f;
 }
 
-// Wrap x into [-range/2, range/2). floorf() rather than a loop so a heading
-// that has accumulated many turns still wraps in constant time.
+// Wrap x into [-range/2, range/2). Most heading errors and sample-to-sample
+// changes already fit. Use a remainder for large inputs to avoid losing the
+// low bits when subtracting a rounded product of range and revolution count.
 float PIDEasy::wrap(float x) {
-  return x - continuous_range * floorf(x * continuous_inv_range + 0.5f);
+  if (fabsf(x) < continuous_range * 0.5f) return x;
+  if (fabsf(x) >= continuous_range) x = fmodf(x, continuous_range);
+  const float magnitude = fabsf(x);
+  const float other_way = continuous_range - magnitude;
+  // Comparing the two distances also handles a subnormal range whose exact
+  // half is unrepresentable. At a tie the negative direction wins.
+  if (x > 0.0f && magnitude >= other_way) return -other_way;
+  if (x < 0.0f && magnitude > other_way) return other_way;
+  return x;
 }
 
 // Shared implementation for every compute / update variant. dt is in seconds.
 float PIDEasy::step(float error, float dInput, DerivativeSource source,
-                float dt, bool resume, float feedforward) {
+                    float dt, bool timed, float feedforward) {
   // A non-finite input (e.g. a line position computed as 0/0 when every
   // sensor reads white) would otherwise latch NaN into the integral and
   // disable the controller until reset(). Hold the last output instead.
-  // The update*() callers have already checked setpoint and measurement,
-  // which dInput and the feedforward are derived from.
+  // For update*(), a non-finite operand or an overflowing subtraction also
+  // produces a non-finite error. Check before consuming any elapsed time.
   if (!isFiniteFloat(error)) return last_output;
+  bool resume = false;
+  if (timed && !measureTime(&dt, &resume)) return last_output;
 
   if (continuous_enabled) error = wrap(error);
 
-  const bool signChanged = (error > 0 && previous_error < 0) || (error < 0 && previous_error > 0);
+  const bool damp = dampingFactor != 1.0f &&
+      ((error > 0 && previous_error < 0) || (error < 0 && previous_error > 0));
   // I-term as it stood before this step, kept so conditional integration
   // can undo the step without also undoing the sign-change damping.
   const float i_before = i_term;
   // Direction this step moves the I-term, for conditional integration.
-  const float ki_error = ki * error;
+  float ki_error = 0.0f;
 
-  // After a gap longer than max_dt_ms the elapsed error is not a meaningful
+  // After a gap longer than the timer cap the elapsed error is not a meaningful
   // area, so skip the accumulation instead of adding one huge step.
   // Accumulating ki * error * dt (rather than error * dt, scaled later)
   // means a ki change affects only future error, never the stored sum.
-  if (!resume) {
+  const bool integrate = integral_step_needed && !resume;
+  if (integrate) {
+    ki_error = ki * error;
     i_term += ki_error * dt;
-    applyIntegralLimits();
+    i_term = constrainFloat(i_term, integral_min, integral_max);
   }
 
-  if (signChanged) {
-      i_term *= dampingFactor;
-  }
+  if (damp) i_term *= dampingFactor;
 
   // On the first sample there is no valid previous input, so the raw
   // derivative would be a spurious spike. Use 0 until we have history.
@@ -135,18 +152,21 @@ float PIDEasy::step(float error, float dInput, DerivativeSource source,
   // it: kd == 0 and no rate tolerance (e.g. a PI speed loop).
   const bool derivative_used = (kd != 0.0f) || (tolerance_enabled && rate_tolerance >= 0.0f);
   float derivative;
-  if (resume || !hasPreviousInput || previous_source != source || !derivative_used) {
+  if (resume || previous_source != source || !derivative_used) {
     derivative = 0.0f;
   } else {
     float delta = dInput - previous_input;
     // A heading crossing 180 -> -180 moved 2 degrees, not 358.
-    if (continuous_enabled) delta = wrap(delta);
+    if (continuous_enabled) {
+      if (!isFiniteFloat(delta)) delta = wrap(dInput) - wrap(previous_input);
+      delta = wrap(delta);
+    }
     derivative = delta / dt;
     // In tau mode the coefficient is rebuilt from dt each call, so the
     // filter keeps the same time constant when the loop period jitters.
     const float smoothing = use_tau_filter
-        ? (derivative_tau / (derivative_tau + dt))
-        : derivative_smoothing;
+        ? (derivative_filter / (derivative_filter + dt))
+        : derivative_filter;
     // Skipped when off (the default): float math is slow without an FPU.
     if (smoothing != 0.0f) {
       derivative = derivative + smoothing * (previous_derivative - derivative);
@@ -162,11 +182,11 @@ float PIDEasy::step(float error, float dInput, DerivativeSource source,
   // and this step pushed it further out, roll the step back. The sign of
   // ki * error gives the direction the step moved the I-term, so this stays
   // correct whatever the sign of ki.
-  if (!resume && conditional_integration) {
+  if (integrate && conditional_integration) {
     const bool pushingUp = (output > max_constrain) && (ki_error > 0.0f);
     const bool pushingDown = (output < min_constrain) && (ki_error < 0.0f);
     if (pushingUp || pushingDown) {
-      i_term = signChanged ? (i_before * dampingFactor) : i_before;
+      i_term = damp ? (i_before * dampingFactor) : i_before;
       output = pdf + i_term;
     }
   }
@@ -175,7 +195,6 @@ float PIDEasy::step(float error, float dInput, DerivativeSource source,
   previous_input = dInput;
   previous_derivative = derivative;
   previous_source = source;
-  hasPreviousInput = true;
 
   last_p = p_term;
   last_i = i_term;
@@ -241,10 +260,9 @@ bool PIDEasy::measureTime(float* dt, bool* resume) {
   // A pause longer than the cap (e.g. robot stopped to signal a victim)
   // makes the integral and derivative for this sample meaningless, so
   // treat it as a resume rather than accumulating one giant step.
-  const uint32_t cap_us = (max_dt_ms > 4294967UL) ? 0xFFFFFFFFUL
-                                                  : (uint32_t)(max_dt_ms * 1000UL);
-  if (max_dt_ms > 0 && elapsed_us > cap_us) {
-    *dt = max_dt_ms * 0.001f;
+  if (elapsed_us > max_dt_us) {
+    // Use the original millisecond conversion for the reported resume dt.
+    *dt = (max_dt_us / 1000UL) * 0.001f;
     *resume = true;
   } else {
     *dt = elapsed_us * 1e-6f;
@@ -277,13 +295,7 @@ float PIDEasy::compute(const float error, const unsigned long dt) {
 
 // Compute using micros() to determine dt. First call initializes internal timer.
 float PIDEasy::compute(const float error) {
-  // Checked before the timer so a rejected sample does not consume elapsed
-  // time: the next valid sample then sees the true gap.
-  if (!isFiniteFloat(error)) return last_output;
-  float dt;
-  bool resume;
-  if (!measureTime(&dt, &resume)) return last_output;
-  return step(error, error, SOURCE_ERROR, dt, resume, 0.0f);
+  return step(error, error, SOURCE_ERROR, 0.0f, true, 0.0f);
 }
 
 // Compute with dt as float seconds. dt <= 0 or NaN holds.
@@ -295,20 +307,17 @@ float PIDEasy::computeSeconds(float error, float dt_s) {
 // Setpoint / measurement variants: the derivative is taken of -measurement,
 // which equals the derivative of the error whenever the setpoint is constant
 // but ignores setpoint steps.
-float PIDEasy::updateInternal(float setpoint, float measurement, float dt, bool resume) {
-  // Guarded here too so a NaN setpoint cannot reach the feedforward.
-  if (!isFiniteFloat(setpoint) || !isFiniteFloat(measurement)) return last_output;
-  const float sign = (setpoint > 0.0f) ? 1.0f : ((setpoint < 0.0f) ? -1.0f : 0.0f);
-  const float feedforward = kf * setpoint + ks * sign;
-  return step(setpoint - measurement, -measurement, SOURCE_MEASUREMENT, dt, resume, feedforward);
+float PIDEasy::updateInternal(float setpoint, float measurement, float dt, bool timed) {
+  float feedforward = 0.0f;
+  if (feedforward_enabled) {
+    const float sign = (setpoint > 0.0f) ? 1.0f : ((setpoint < 0.0f) ? -1.0f : 0.0f);
+    feedforward = kf * setpoint + ks * sign;
+  }
+  return step(setpoint - measurement, -measurement, SOURCE_MEASUREMENT, dt, timed, feedforward);
 }
 
 float PIDEasy::update(const float setpoint, const float measurement) {
-  if (!isFiniteFloat(setpoint) || !isFiniteFloat(measurement)) return last_output;
-  float dt;
-  bool resume;
-  if (!measureTime(&dt, &resume)) return last_output;
-  return updateInternal(setpoint, measurement, dt, resume);
+  return updateInternal(setpoint, measurement, 0.0f, true);
 }
 
 float PIDEasy::updateMs(const float setpoint, const float measurement, const unsigned long dt_ms) {
@@ -336,7 +345,7 @@ void PIDEasy::setTunings(const float kp, const float ki, const float kd) {
   // previous mode would only be a hidden constant offset.
   if (ki == 0.0f) i_term = 0.0f;
   // The raw windup clamp is scaled by ki, so re-apply the limits.
-  applyIntegralLimits();
+  refreshIntegralLimits();
 }
 
 float PIDEasy::getKp() const { return this->kp; }
@@ -352,7 +361,7 @@ void PIDEasy::setConstrain(float min, float max) {
   this->min_constrain = min;
   this->max_constrain = max;
   // The I-term is bounded by the width of the output range.
-  applyIntegralLimits();
+  refreshIntegralLimits();
 }
 
 // Reset the PID controller's internal state.
@@ -361,7 +370,7 @@ void PIDEasy::reset() {
   previous_input = 0.0f;
   previous_derivative = 0.0f;
   i_term = 0.0f;
-  hasPreviousInput = false;
+  previous_source = SOURCE_NONE;
   hasLastMicros = false;
   lastMicros = 0;
   last_p = 0.0f;
@@ -383,8 +392,7 @@ void PIDEasy::resetIntegral() {
 // Preload the I-term in output units, within the integral limits.
 void PIDEasy::setIntegral(float value) {
   if (!isFiniteFloat(value)) return;
-  i_term = value;
-  applyIntegralLimits();
+  i_term = constrainFloat(value, integral_min, integral_max);
 }
 
 // Set the smoothing factor for the derivative term to reduce noise sensitivity.
@@ -392,7 +400,7 @@ void PIDEasy::setIntegral(float value) {
 void PIDEasy::setSmoothingDerivative(float sD) {
   if (sD < 0.0f) sD = 0.0f;
   if (sD > 1.0f) sD = 1.0f;
-  this->derivative_smoothing = sD;
+  this->derivative_filter = sD;
   this->use_tau_filter = false; // fixed coefficient takes over from tau mode
 }
 
@@ -407,12 +415,11 @@ void PIDEasy::setSmoothingDerivate(float sD) {
 // 0 (or negative) turns derivative filtering off entirely.
 void PIDEasy::setDerivativeTimeConstant(float tauSeconds) {
   if (tauSeconds <= 0.0f) {
-    this->derivative_tau = 0.0f;
     this->use_tau_filter = false;
-    this->derivative_smoothing = 0.0f;
+    this->derivative_filter = 0.0f;
     return;
   }
-  this->derivative_tau = tauSeconds;
+  this->derivative_filter = tauSeconds;
   this->use_tau_filter = true;
 }
 
@@ -424,7 +431,7 @@ void PIDEasy::setWindUP(float min, float max) {
   this->min_windup = min;
   this->max_windup = max;
   this->windup_enabled = true;
-  applyIntegralLimits();
+  refreshIntegralLimits();
 }
 
 // Limit the integral's contribution to the output (ki * integral) rather than
@@ -435,8 +442,7 @@ void PIDEasy::setIntegralLimit(float min, float max) {
   if (min > max) { const float tmp = min; min = max; max = tmp; }
   this->min_integral_out = min;
   this->max_integral_out = max;
-  this->integral_limit_enabled = !(min == 0.0f && max == 0.0f);
-  applyIntegralLimits();
+  refreshIntegralLimits();
 }
 
 // Enable or disable conditional integration (enabled by default).
@@ -459,7 +465,6 @@ void PIDEasy::setContinuousInput(float min, float max) {
   if (min > max) { const float tmp = min; min = max; max = tmp; }
   this->continuous_range = max - min;
   this->continuous_enabled = (max > min) && isFiniteFloat(continuous_range);
-  this->continuous_inv_range = continuous_enabled ? 1.0f / continuous_range : 0.0f;
 }
 
 void PIDEasy::disableContinuousInput() {
@@ -484,6 +489,7 @@ bool PIDEasy::atSetpoint() const {
 void PIDEasy::setFeedforward(float kF, float kS) {
   this->kf = kF;
   this->ks = kS;
+  this->feedforward_enabled = kF != 0.0f || kS != 0.0f;
 }
 
 // Minimum nonzero output magnitude (motor deadband). 0 disables.
@@ -499,7 +505,10 @@ void PIDEasy::setOutputRampRate(float unitsPerSecond) {
 // Longest gap that still counts as a normal cycle for the internally timed
 // variants. 0 disables the cap.
 void PIDEasy::setMaxDeltaTime(unsigned long maxDtMs) {
-  this->max_dt_ms = maxDtMs;
+  // No 32-bit elapsed time can exceed the sentinel. Convert only once,
+  // including on hosts where unsigned long is wider than the board clock.
+  max_dt_us = (maxDtMs == 0 || maxDtMs > UINT32_MAX / 1000UL)
+      ? UINT32_MAX : maxDtMs * 1000UL;
 }
 
 // Per-term contributions from the last compute call, for tuning telemetry.

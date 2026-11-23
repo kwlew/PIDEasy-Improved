@@ -34,6 +34,19 @@ You need a C++ compiler on `PATH`. On Windows, `g++` from
 
 ## How it works
 
+### Timing the control loop
+
+From the repository root, build the desktop benchmark with optimizations enabled.
+
+```bash
+g++ -std=c++11 -O2 -Iextras/test -Isrc extras/test/benchmark.cpp src/PIDEasy.cpp -o /tmp/pideasy-bench
+/tmp/pideasy-bench
+```
+
+Each row times three million samples from the same triangle wave and prints the final output. For a before/after comparison, compile this benchmark against each revision's matching header and implementation with the same compiler and flags. Alternate the two binaries across several runs and compare median times. The reported times apply to the host CPU.
+
+### Fake Arduino clock
+
 `Arduino.h` here is a **stub**, not the real Arduino core. The library only needs
 `micros()`, so the stub provides it backed by a fake 32-bit clock that the tests
 drive directly:

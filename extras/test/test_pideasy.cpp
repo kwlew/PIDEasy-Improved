@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cmath>
+#include <limits>
 #include "PIDEasy.h"
 
 // Backing store for the fake clock declared in the Arduino.h stub.
@@ -139,6 +140,29 @@ static void test_integral_limit() {
   f.setFeedforward(1.0f, 0.0f);
   for (int i = 0; i < 100; i++) f.updateMs(100.0f, 110.0f, 10);  // 10 too fast
   check("one-sided range: I-term can go negative", f.getI() < -9.0f);
+
+  PID limits(0.0f, -2.0f, 0.0f);
+  limits.setConstrain(-5, 5);               // width 10
+  limits.setWindUP(1, 4);                   // output units [-8, -2]
+  limits.setIntegral(100);
+  check("negative ki reverses raw windup endpoints", limits.computeSeconds(0, 1) == -2);
+  limits.setIntegralLimit(20, 30);          // disjoint, applied last in 1.2.0
+  limits.computeSeconds(0, 1);
+  check("disjoint clamps retain legacy precedence", limits.getI() == 20);
+  limits.setIntegralLimit(0, 0);
+  limits.setTunings(0, 3, 0);               // [3, 12] clipped by width to [3, 10]
+  limits.setIntegral(100);
+  limits.computeSeconds(0, 1);
+  check("retuning refreshes the effective integral limits", limits.getI() == 10);
+
+  PID preload(0, 0, 0);
+  preload.setIntegral(12);
+  preload.setDampingFactor(0.5f);
+  preload.computeMs(1, 10);
+  check("zero ki still damps a preloaded integral", preload.computeMs(-1, 10) == 6);
+  preload.setIntegralLimit(7, 10);
+  preload.resetIntegral();
+  check("zero ki reapplies a one-sided limit after resetIntegral", preload.computeMs(-1, 10) == 7);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +260,17 @@ static void test_dt_and_resume() {
   setMillis(140); d.compute(1.0f);
   check("over-cap gap reports a resume", d.wasResumed() && near(d.getDeltaTime(), 0.100f, 1e-6f));
 
+  advanceMicros(100000);
+  d.compute(1);
+  check("gap exactly at the cap integrates", !d.wasResumed());
+  advanceMicros(100001);
+  d.compute(1);
+  check("one microsecond over the cap resumes", d.wasResumed());
+  d.setMaxDeltaTime(UINT32_MAX / 1000UL + 1);
+  advanceMicros(UINT32_MAX);
+  d.compute(1);
+  check("a cap wider than the clock never wraps", !d.wasResumed());
+
   // Default cap is 500 ms: a slow 120 ms maze loop must still integrate.
   PID m(0.0f, 1.0f, 0.0f);
   setMillis(0); m.compute(5.0f);
@@ -299,6 +334,19 @@ static void test_update() {
   check("updateMs with dt = 0 holds", near(z.updateMs(50.0f, 0.0f, 0), 5.0f));
   check("NaN measurement holds", near(z.updateMs(5.0f, nanf(""), 10), 5.0f));
 
+  const float largest = std::numeric_limits<float>::max();
+  advanceMillis(20);
+  check("overflowing setpoint error holds output", near(t.update(largest, -largest), 0.050f));
+  advanceMillis(20);
+  t.update(1, 0);
+  check("rejected setpoint error preserves elapsed time", near(t.getDeltaTime(), 0.040f));
+
+  PID mixed(0, 0, 1);
+  mixed.computeSeconds(10, 1);
+  check("compute to update clears derivative history", mixed.updateSeconds(0, 2, 1) == 0);
+  check("derivative resumes on the same source", mixed.updateSeconds(0, 5, 1) == -3);
+  check("update to compute clears derivative history", mixed.computeSeconds(10, 1) == 0);
+
   PID u(0.0f, 1.0f, 0.0f);
   u.updateUs(1.0f, 0.0f, 250);
   check("updateUs integrates microseconds", near(u.getI(), 0.00025f, 1e-7f));
@@ -326,6 +374,14 @@ static void test_continuous_input() {
   e.setContinuousInput(-180.0f, 180.0f);
   check("compute(error) wraps the error too", near(e.computeMs(-340.0f, 10), 20.0f));
   check("many turns still wrap", near(e.computeMs(3600.0f + 30.0f, 10), 30.0f, 1e-2f));
+  check("large headings retain the modulo remainder", e.computeMs(4294967296.0f, 10) == -104);
+  check("both half-turn ties choose the negative direction",
+        e.computeMs(180, 10) == -180 && e.computeMs(-180, 10) == -180);
+  const float below_half = std::nextafter(180.0f, 0.0f);
+  check("just below a half turn keeps its direction", e.computeMs(below_half, 10) == below_half);
+  const float tiny = std::numeric_limits<float>::denorm_min();
+  e.setContinuousInput(0, 3 * tiny);
+  check("subnormal circular range wraps a finite input", e.computeMs(2 * tiny, 10) == -tiny);
 
   // The derivative across the wrap point is the short way round.
   PID d(0.0f, 0.0f, 1.0f);
@@ -334,6 +390,9 @@ static void test_continuous_input() {
   d.updateMs(0.0f, 179.0f, 10);
   d.updateMs(0.0f, -179.0f, 10);         // measurement moved +2 degrees
   check("derivative across 180/-180 is the short way", near(d.getD(), -200.0f, 1e-2f));
+  const float large = std::ldexp(1.0f, 127);
+  d.computeSeconds(-large, 1);
+  check("circular derivative survives an overflowing difference", d.computeSeconds(large, 1) == -104);
 
   PID off(1.0f, 0.0f, 0.0f);
   off.setConstrain(-1000.0f, 1000.0f);
@@ -382,6 +441,8 @@ static void test_feedforward_and_shaping() {
   check("kS follows the setpoint sign", near(f.updateMs(-100.0f, -100.0f, 10), -70.0f));
   check("zero setpoint gives zero feedforward", near(f.updateMs(0.0f, 0.0f, 10), 0.0f));
   check("feedforward does not apply to compute()", near(f.computeMs(0.0f, 10), 0.0f));
+  f.setFeedforward(0, 0);
+  check("disabling feedforward takes effect on the next update", f.updateMs(100, 100, 10) == 0);
 
   // Minimum output lifts small outputs, but not inside the tolerance band.
   PID m(1.0f, 0.0f, 0.0f);
@@ -580,6 +641,7 @@ static void test_backwards_compatibility() {
 
   PID q(0.0f, 1.0f, 0.0f);
   check("computeMs still integrates in ms", near(q.computeMs(10.0f, 500), 5.0f));
+  check("computeMs zero still advances by 1 ms", near(q.computeMs(10, 0), 5.01f));
 
   PID r(1.0f, 0.0f, 0.0f);
   r.setConstrain(-5.0f, 5.0f);

@@ -27,7 +27,7 @@ And from 1.1.1:
 
 Each `compute*` / `update*` call does, in order:
 
-0. **Hold checks.** If an input is NaN or infinite, or no time has passed (dt = 0 in the new variants, or the internal timer has not ticked), the call returns the previous output and changes nothing.
+0. **Hold checks.** A non-finite input or an overflowing `setpoint − measurement` holds the last output and preserves the internal timestamp. Zero elapsed time also holds, except for the legacy `computeMs(error, 0)` and `compute(error, 0)` conventions below.
 1. **Error.** `error` is either passed in (`compute*`) or `setpoint − measurement` (`update*`). With `setContinuousInput()` it is wrapped into ± half the range.
 2. **Integral.** `I += ki × error × dt`, then I is clamped to ± the output range width, to `ki × setWindUP()` limits if set, and to `setIntegralLimit()` if set. **Skipped on a resume sample.**
 3. **Damping.** If `error` changed sign versus the previous call (strictly), `I *= dampingFactor`.
@@ -222,7 +222,7 @@ Print at 115200 baud, and not every loop: at 9600 baud a single line can block t
 
 ## Cost on an Arduino Uno
 
-Measured in simavr on an ATmega328P at 16 MHz (no FPU), `-Os`:
+The figures below are the 1.2.0 baseline, measured in simavr on an ATmega328P at 16 MHz with `-Os`.
 
 | Call | Cycles | Time |
 |---|---|---|
@@ -243,7 +243,7 @@ RAM: 147 bytes per controller on AVR. Boards with an FPU (ESP32, Teensy 4, RP235
 ./extras/test/run_tests.sh          # or .\extras\test\run_tests.ps1 on Windows
 ```
 
-102 checks. Non-zero exit on failure. CI also runs them under AddressSanitizer/UBSan and clang, runs `arduino-lint`, and compiles the examples for Uno, Mega, Raspberry Pi Pico and ESP32. See `extras/test/README.md`.
+The runner exits non-zero on failure. CI also runs the checks under AddressSanitizer/UBSan and clang, runs `arduino-lint`, and compiles the examples for Uno, Mega, Raspberry Pi Pico and ESP32. The host benchmark covers six control-loop configurations. [Test and benchmark instructions](extras/test/README.md)
 
 ---
 

@@ -27,7 +27,7 @@ class PIDEasy {
     float compute(float error, unsigned long dt);
 
     // Pass `dt` in seconds as a float (e.g. 0.02 for a 20 ms loop).
-    // dt <= 0 (or NaN) returns the last output and updates nothing.
+    // Non-positive or non-finite dt returns the last output and updates nothing.
     float computeSeconds(float error, float dt_s);
 
     // New Variant: pass `dt` in milliseconds.
@@ -176,17 +176,16 @@ class PIDEasy {
 
   private:
     // Where the derivative is taken from.
-    enum DerivativeSource { SOURCE_ERROR, SOURCE_MEASUREMENT };
+    enum DerivativeSource { SOURCE_ERROR, SOURCE_MEASUREMENT, SOURCE_NONE };
 
     // Shared implementation. dt is in seconds. `dInput` is the quantity the
-    // derivative is taken of (the error, or minus the measurement). `resume`
-    // marks a sample without meaningful elapsed time: the integral and
-    // derivative are skipped.
+    // derivative is taken of (the error, or minus the measurement). When
+    // timed is true, read the internal clock after validating the error.
     float step(float error, float dInput, DerivativeSource source,
-               float dt, bool resume, float feedforward);
+               float dt, bool timed, float feedforward);
 
     // Feedforward and error for the setpoint / measurement variants.
-    float updateInternal(float setpoint, float measurement, float dt, bool resume);
+    float updateInternal(float setpoint, float measurement, float dt, bool timed);
 
     // Wrap a difference into half the continuous range either way.
     float wrap(float x);
@@ -195,9 +194,8 @@ class PIDEasy {
     // passed since the previous call, in which case the caller holds.
     bool measureTime(float* dt, bool* resume);
 
-    // Clamp the I-term to the output range, the windup limits and, if
-    // enabled, the output-unit integral limit.
-    void applyIntegralLimits();
+    // Combine the configured clamps and apply them to the current I-term.
+    void refreshIntegralLimits();
 
     float kp, ki, kd;
     float previous_error;
@@ -208,14 +206,12 @@ class PIDEasy {
     float min_windup, max_windup;
     bool windup_enabled;
     float min_integral_out, max_integral_out;
-    bool integral_limit_enabled;
+    bool feedforward_enabled;
     bool conditional_integration;
-    float derivative_smoothing, dampingFactor;
+    float integral_min, integral_max;
 
-    // Derivative filter time constant in seconds. While use_tau_filter is
-    // true the smoothing coefficient is derived from it and dt each call,
-    // instead of using the fixed derivative_smoothing value.
-    float derivative_tau;
+    // Fixed smoothing coefficient, or time constant in seconds in tau mode.
+    float derivative_filter;
     bool use_tau_filter;
 
     float min_constrain, max_constrain;
@@ -226,15 +222,13 @@ class PIDEasy {
     float last_dt;
     bool last_resumed;
 
-    // True once a valid previous_input exists; used to suppress the
-    // derivative term on the first sample (avoids a derivative "kick").
-    bool hasPreviousInput;
+    // With zero ki, only one-sided limits that exclude zero can require a
+    // fresh clamp after resetIntegral() or sign-change damping.
+    bool integral_step_needed;
     uint8_t previous_source; // a DerivativeSource, stored in one byte
 
-    // For the internally timed compute(error) / update().
-    // max - min of the circular range, and its inverse so wrapping needs
-    // no division.
-    float continuous_range, continuous_inv_range;
+    float dampingFactor;
+    float continuous_range;
     bool continuous_enabled;
 
     float error_tolerance, rate_tolerance, settle_s;
@@ -249,7 +243,7 @@ class PIDEasy {
 
     uint32_t lastMicros;
     bool hasLastMicros;
-    unsigned long max_dt_ms;
+    unsigned long max_dt_us;
 };
 
 #ifndef PIDEASY_NO_PID_ALIAS
